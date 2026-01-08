@@ -1,6 +1,0 @@
-[package]
-name = "tiny-skia"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
