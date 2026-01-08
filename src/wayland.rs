@@ -2,15 +2,15 @@ use std::{
     borrow::Borrow,
     ffi::{c_char, c_void},
     mem,
+    os::fd::BorrowedFd,
     pin::Pin,
     ptr::{NonNull, null},
 };
 
+use compio::net::PollFd;
 use iced::{Point, mouse};
-use tokio::{
-    io::unix::AsyncFd,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-};
+
+use crate::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
 #[allow(non_camel_case_types, non_upper_case_globals, unused)]
 pub mod ffi {
@@ -58,17 +58,17 @@ impl Server {
 
         unsafe {
             let fd = ffi::wl_display_get_fd(display);
-            let fd = AsyncFd::new(fd).unwrap();
+            let fd = BorrowedFd::borrow_raw(fd);
+            let fd = PollFd::new(fd).unwrap();
             loop {
                 // std::thread::sleep(std::time::Duration::from_secs(1));
                 if ffi::wl_display_prepare_read(display) != 0 {
                     panic!("queue not empty");
                 }
-                let mut ready = fd.readable().await.unwrap();
+                fd.read_ready().await.unwrap();
                 if ffi::wl_display_read_events(display) == -1 {
                     panic!("error read events");
                 }
-                ready.clear_ready();
 
                 if ffi::wl_display_dispatch_pending(display) == -1 {
                     panic!("error dispatch events");
@@ -304,7 +304,7 @@ pub fn new() -> (Server, Client) {
     unsafe { ffi::wl_registry_add_listener(registry, &REGISTRY_LISTENER, &raw mut globals as _) };
     unsafe { ffi::wl_display_roundtrip(display.as_ptr()) };
     let globals = globals.build();
-    let (notifier, events) = unbounded_channel();
+    let (notifier, events) = unbounded();
     let notifier = Box::pin(notifier);
     (
         Server { display },

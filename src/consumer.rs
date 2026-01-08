@@ -3,13 +3,13 @@ use std::ptr::{self, NonNull};
 use iced::{Font, Pixels, Theme};
 use iced_tiny_skia::Renderer;
 use rustc_hash::FxHashMap;
-use tokio::sync::mpsc::channel;
 
 use crate::{
     consumer::{
         programs::Bar,
         window::{Layer, Role, Window, WindowManager},
     },
+    sync::mpsc::channel,
     wayland::{self, Callback},
 };
 
@@ -33,12 +33,12 @@ impl Consumer {
                 },
             display,
         } = self;
-        let (sender, mut receiver) = channel(1);
+        let (mut sender, mut receiver) = channel(1);
 
         let wayland = async move {
             loop {
                 sender
-                    .send(Event::Wayland(wayland_events.recv().await.unwrap()))
+                    .send(Event::Wayland(wayland_events.receive().await.unwrap()))
                     .await
                     .unwrap();
             }
@@ -48,14 +48,14 @@ impl Consumer {
 
         let consumer = async move {
             loop {
-                match receiver.recv().await.unwrap() {
+                match receiver.receive().await.unwrap() {
                     Event::Wayland(event) => runner.dispatch_wayland(event),
                 }
             }
         };
 
         async move {
-            tokio::join!(wayland, consumer);
+            std::future::join!(wayland, consumer).await;
         }
     }
 }
