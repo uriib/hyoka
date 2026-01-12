@@ -4,7 +4,7 @@ use std::{
     mem,
     os::fd::BorrowedFd,
     pin::Pin,
-    ptr::{NonNull, null},
+    ptr::{self, NonNull},
 };
 
 use compio::net::PollFd;
@@ -104,6 +104,15 @@ const REGISTRY_LISTENER: ffi::wl_registry_listener = ffi::wl_registry_listener {
     global_remove: nop!(),
 };
 
+const WM_BASE_LISTENER: ffi::xdg_wm_base_listener = ffi::xdg_wm_base_listener {
+    ping: Some({
+        extern "C" fn ping(_: *mut c_void, wm_base: *mut ffi::xdg_wm_base, serial: u32) {
+            unsafe { ffi::xdg_wm_base_pong(wm_base, serial) }
+        }
+        ping
+    }),
+};
+
 pub type Fixed = ffi::wl_fixed_t;
 
 impl Fixed {
@@ -133,17 +142,16 @@ pub const POINTER_LISTENERL: ffi::wl_pointer_listener = ffi::wl_pointer_listener
             y: Fixed,
         ) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
-            notifier
-                .send(Event::Enter {
-                    surface: NonNull::new(surface).unwrap(),
-                    serial,
-                })
-                .unwrap();
-            notifier
-                .send(Event::Mouse(mouse::Event::CursorMoved {
-                    position: Point::new(x.into(), y.into()),
-                }))
-                .unwrap();
+            // Sometimes surface is null. Why can surface be null ? idk. It's not nullable in protocol
+            // Maybe a bug of Hyprland
+            if let Some(surface) = NonNull::new(surface) {
+                notifier.send(Event::Enter { surface, serial }).unwrap();
+                notifier
+                    .send(Event::Mouse(mouse::Event::CursorMoved {
+                        position: Point::new(x.into(), y.into()),
+                    }))
+                    .unwrap();
+            }
         }
         Some(enter)
     },
@@ -155,6 +163,14 @@ pub const POINTER_LISTENERL: ffi::wl_pointer_listener = ffi::wl_pointer_listener
             _surface: *mut ffi::wl_surface,
         ) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
+            // notifier
+            //     .send(Event::Mouse(mouse::Event::CursorMoved {
+            //         position: Point {
+            //             x: f32::INFINITY,
+            //             y: f32::INFINITY,
+            //         },
+            //     }))
+            //     .unwrap();
             notifier
                 .send(Event::Mouse(mouse::Event::CursorLeft))
                 .unwrap();
@@ -214,9 +230,63 @@ pub const POINTER_LISTENERL: ffi::wl_pointer_listener = ffi::wl_pointer_listener
     axis_relative_direction: nop!(),
 };
 
+pub const XDG_SURFACE_LISTENER: ffi::xdg_surface_listener = ffi::xdg_surface_listener {
+    configure: {
+        extern "C" fn configure(_: *mut c_void, surface: *mut ffi::xdg_surface, serial: u32) {
+            unsafe { ffi::xdg_surface_ack_configure(surface, serial) }
+        }
+        Some(configure)
+    },
+};
+
+pub const XDG_POPUP_LISTENER: ffi::xdg_popup_listener = ffi::xdg_popup_listener {
+    configure: {
+        extern "C" fn configure(
+            data: *mut c_void,
+            popup: *mut ffi::xdg_popup,
+            _x: i32,
+            _y: i32,
+            width: i32,
+            height: i32,
+        ) {
+            let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
+            let size = [width as u32, height as u32];
+            notifier
+                .send(Event::Resize {
+                    object: NonNull::new(popup as _).unwrap(),
+                    size,
+                })
+                .unwrap();
+        }
+        Some(configure)
+    },
+    popup_done: nop!(),
+    repositioned: nop!(),
+};
+
 pub const SURFACE_LISTENER: ffi::wl_surface_listener = ffi::wl_surface_listener {
     enter: nop!(),
     leave: nop!(),
+    // enter: {
+    //     extern "C" fn enter(
+    //         data: *mut c_void,
+    //         surface: *mut ffi::wl_surface,
+    //         output: *mut ffi::wl_output,
+    //     ) {
+    //         dbg!(output);
+    //     }
+    //     Some(enter)
+    // },
+    // leave: {
+    //     extern "C" fn leave(
+    //         data: *mut c_void,
+    //         surface: *mut ffi::wl_surface,
+    //         output: *mut ffi::wl_output,
+    //     ) {
+    //         dbg!(output);
+    //     }
+    //     Some(leave)
+    // },
     preferred_buffer_scale: {
         extern "C" fn scale(data: *mut c_void, surface: *mut ffi::wl_surface, scale: i32) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
@@ -265,9 +335,7 @@ pub const CALLBACK_LISTENER: ffi::wl_callback_listener = ffi::wl_callback_listen
         ) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
             notifier
-                .send(Event::CallbackDone(unsafe {
-                    NonNull::new_unchecked(callback)
-                }))
+                .send(Event::CallbackDone(NonNull::new(callback).unwrap()))
                 .unwrap();
         }
         Some(done)
@@ -298,12 +366,18 @@ impl Drop for Callback {
 }
 
 pub fn new() -> (Server, Client) {
-    let display = NonNull::new(unsafe { ffi::wl_display_connect(null()) }).unwrap();
+    // let name = std::env::var_os("WAYLAND_DISPLAY")
+    //     .unwrap()
+    //     .into_c_str()
+    //     .unwrap();
+    // let name = name.as_c_str();
+    let display = NonNull::new(unsafe { ffi::wl_display_connect(ptr::null_mut()) }).unwrap();
     let registry = unsafe { ffi::wl_display_get_registry(display.as_ptr()) };
     let mut globals = GlobalsBuilder::default();
     unsafe { ffi::wl_registry_add_listener(registry, &REGISTRY_LISTENER, &raw mut globals as _) };
     unsafe { ffi::wl_display_roundtrip(display.as_ptr()) };
     let globals = globals.build();
+    unsafe { ffi::xdg_wm_base_add_listener(globals.wm_base(), &WM_BASE_LISTENER, ptr::null_mut()) };
     let (notifier, events) = unbounded();
     let notifier = Box::pin(notifier);
     (
@@ -364,10 +438,11 @@ macro_rules! use_globals {
 
 use_globals! {
     pub compositer: wl_compositor,
-    pub shm: wl_shm,
-    pub seat: wl_seat,
-    pub layer_shell: zwlr_layer_shell_v1,
     pub cursor_shape_manager: wp_cursor_shape_manager_v1,
+    pub layer_shell: zwlr_layer_shell_v1,
+    pub seat: wl_seat,
+    pub shm: wl_shm,
+    pub wm_base: xdg_wm_base,
 }
 
 #[repr(C)]

@@ -4,12 +4,14 @@ use std::{
     slice,
 };
 
+use bytes::Bytes;
+use compio::buf::{IoBuf, IoBufMut, SetBufInit};
 use rustix::{
     io,
     mm::{MapFlags, ProtFlags},
 };
 
-pub trait Size: Copy {
+pub trait Size: Copy + 'static {
     fn size(self) -> usize;
 }
 
@@ -72,5 +74,80 @@ impl Mapping<Const<4096>> {
             ProtFlags::READ | ProtFlags::WRITE,
             MapFlags::PRIVATE,
         )
+    }
+}
+
+unsafe impl<S: Size> IoBufMut for Mapping<S> {
+    fn as_buf_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+unsafe impl<S: Size> IoBuf for Mapping<S> {
+    fn as_buf_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    // use it to read only once
+    fn buf_len(&self) -> usize {
+        0
+    }
+
+    fn buf_capacity(&self) -> usize {
+        self.len.size()
+    }
+}
+
+impl<S: Size> SetBufInit for Mapping<S> {
+    unsafe fn set_buf_init(&mut self, _len: usize) {}
+}
+
+// struct Buffer<S: Size> {
+//     mapping: Mapping<S>,
+//     len: usize,
+// }
+//
+// impl<S: Size> Buffer<S> {
+//     fn new(mapping: Mapping<S>) -> Self {
+//         Self { mapping, len: 0 }
+//     }
+// }
+//
+// unsafe impl<S: Size> IoBufMut for Buffer<S> {
+//     fn as_buf_mut_ptr(&mut self) -> *mut u8 {
+//         self.mapping.ptr.as_ptr()
+//     }
+// }
+//
+// unsafe impl<S: Size> IoBuf for Buffer<S> {
+//     fn as_buf_ptr(&self) -> *const u8 {
+//         self.mapping.ptr.as_ptr()
+//     }
+//
+//     // use it to read only once
+//     fn buf_len(&self) -> usize {
+//         0
+//     }
+//
+//     fn buf_capacity(&self) -> usize {
+//         self.len.size()
+//     }
+// }
+//
+// impl<S: Size> SetBufInit for Buffer<S> {
+//     unsafe fn set_buf_init(&mut self, _len: usize) {}
+// }
+
+impl<S: Size> AsRef<[u8]> for Mapping<S> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+unsafe impl<S: Size> Send for Mapping<S> {}
+
+impl<S: Size> Into<Bytes> for Mapping<S> {
+    fn into(self) -> Bytes {
+        Bytes::from_owner(self)
     }
 }

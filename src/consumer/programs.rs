@@ -1,60 +1,80 @@
-use std::rc::Rc;
-
 use iced::{
-    Theme,
-    widget::{button, svg},
+    Border, Color, Length, Shadow, Theme,
+    widget::{container, text},
 };
 use iced_tiny_skia::Renderer;
 
-use crate::consumer::Runner;
+use crate::consumer::{Action, AppEvent};
 
 pub trait Program {
     fn view(&self) -> Element<'_>;
     fn update(&mut self, message: Message);
+    fn dispatch(&mut self, event: AppEvent) {
+        _ = event;
+    }
+    fn background(&self, theme: &Theme) -> Color {
+        theme.palette().background
+    }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Signal {
     Message(Message),
-    Action(Rc<dyn Fn(&mut Runner)>),
+    Action(Action),
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Hello,
+    Bye,
 }
 
 pub type UserInterface<'ui> = iced_runtime::UserInterface<'ui, Signal, Theme, Renderer>;
 pub type Element<'ui> = iced::Element<'ui, Signal, Theme, Renderer>;
 
-pub struct Bar {}
+pub use bar::Bar;
+pub struct WindowInfo {
+    content: String,
+}
 
-impl Bar {
-    fn logo(&self) -> impl Into<Element<'_>> {
-        button(
-            svg("/usr/share/pixmaps/archlinux-logo.svg")
-                .style(|theme: &Theme, status| svg::Style {
-                    color: Some(match status {
-                        svg::Status::Idle => theme.palette().text,
-                        svg::Status::Hovered => theme.palette().primary,
-                    }),
-                })
-                .width(23),
-        )
-        .style(|_, _| button::Style::default())
-        .on_press(Signal::Message(Message::Hello))
-        .clip(false)
+impl WindowInfo {
+    pub fn new(content: String) -> Self {
+        let content = content.replace("\t", "        ");
+        Self { content }
     }
 }
 
-impl Program for Bar {
+impl Program for WindowInfo {
     fn view(&self) -> Element<'_> {
-        self.logo().into()
-        // button("hello")
-        //     .on_press(Signal::Message(Message::Hello))
-        //     .into()
+        let text = text(self.content.trim_end()).wrapping(text::Wrapping::None);
+        container(text)
+            .style(|theme: &Theme| container::Style {
+                text_color: None,
+                background: Some(theme.palette().background.into()),
+                border: Border::default().rounded(13),
+                shadow: Shadow::default(),
+                snap: false,
+            })
+            .padding(13.0)
+            .center(Length::Shrink)
+            .into()
     }
-    fn update(&mut self, message: Message) {
-        dbg!(message);
+
+    fn update(&mut self, _message: Message) {}
+    fn background(&self, _theme: &Theme) -> Color {
+        Color::TRANSPARENT
     }
 }
+
+pub trait ColorExt {
+    fn with_alpha(self, a: f32) -> Self;
+}
+
+impl ColorExt for Color {
+    fn with_alpha(self, a: f32) -> Self {
+        let Self { r, g, b, a: _ } = self;
+        Self { r, g, b, a }
+    }
+}
+
+mod bar;

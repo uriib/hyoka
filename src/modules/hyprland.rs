@@ -1,29 +1,27 @@
-use std::{
-    env,
-    io::{self, Cursor, Write as _},
-    mem::MaybeUninit,
-    os::{
-        fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd, OwnedFd},
-        unix::net,
-    },
-    path::PathBuf,
+use std::{env, io::Write, path::PathBuf};
+
+use compio::{
+    BufResult,
+    buf::IoBuf,
+    io::{AsyncRead as _, AsyncReadExt, AsyncWrite as _},
+    net::UnixStream,
 };
 
-use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
-// use tokio::io::AsyncReadExt as _;
-
-use crate::mapping::Mapping;
-
-pub struct Context {
-    /// hyprland instance signature
-    his: PathBuf,
-    listener: OwnedFd,
-}
+use crate::{
+    TinyString,
+    mapping::Mapping,
+    sync::mpsc::{self, Receiver, Sender},
+};
 
 fn xdg_runtime_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR")
         .map(Into::into)
         .unwrap_or_else(|| format!("/run/user/{}", rustix::process::getuid()).into())
+}
+
+pub struct Context {
+    /// hyprland instance signature
+    his: PathBuf,
 }
 
 impl Context {
@@ -32,118 +30,89 @@ impl Context {
         dir.push("hypr");
         dir.push(env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?);
         let his = dir;
-        let socket = rustix::net::socket_with(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            None,
-        )
-        .unwrap();
-        rustix::net::connect(
-            &socket,
-            &SocketAddrUnix::new(his.join(".socket2.sock")).unwrap(),
-        )
-        .unwrap();
-        Some(Self {
-            his,
-            listener: socket,
-        })
+        Some(Self { his })
     }
-    fn controller(&self) -> Controller {
-        let socket = rustix::net::socket_with(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            None,
-        )
-        .unwrap();
-        rustix::net::connect(
-            &socket,
-            &SocketAddrUnix::new(self.his.join(".socket.sock")).unwrap(),
-        )
-        .unwrap();
-        Controller { socket }
-    }
-    pub async fn request<'a>(
-        &self,
-        req: &[u8],
-        res: &'a mut [MaybeUninit<u8>],
-    ) -> io::Result<&'a str> {
-        self.controller().request(req, res).await
-    }
-    pub fn command_quiet(&self, cmd: Command) -> io::Result<()> {
-        let mut buf = MaybeUninit::<[u8; 64]>::uninit();
-        let buf = unsafe { buf.assume_init_mut() };
-        let mut buf = Cursor::new(&mut buf[..]);
-        match cmd {
-            Command::Workspace(id) => {
-                write!(&mut buf, "q/dispatch workspace {id}").unwrap();
-                let writen = buf.position() as usize;
-                self.controller()
-                    .request_quiet(&buf.into_inner()[..writen])?;
-            }
+    pub async fn controller(&self) -> Controller {
+        Controller {
+            stream: UnixStream::connect(self.his.join(".socket.sock"))
+                .await
+                .unwrap(),
         }
-        Ok(())
     }
-    pub fn listener(&self) -> Listener<'_> {
+    async fn listener(&self) -> Listener {
         Listener {
-            socket: self.listener.as_fd(),
+            stream: UnixStream::connect(self.his.join(".socket2.sock"))
+                .await
+                .unwrap(),
         }
     }
 }
 
-pub trait Handler {
-    async fn workspace(&self, id: usize);
-    async fn create_workspace(&self, id: usize);
-    async fn destroy_workspace(&self, id: usize);
-    async fn active_window(&self, class: &str, title: &str);
-}
-
-pub struct Listener<'a> {
-    socket: BorrowedFd<'a>,
+pub struct Listener {
+    stream: UnixStream,
 }
 
 pub struct Controller {
-    socket: OwnedFd,
+    stream: UnixStream,
 }
 
-impl Listener<'_> {
-    pub async fn listen(self, mut handler: impl Handler) {
-        let mut stream = tokio::net::UnixStream::from_std(unsafe {
-            net::UnixStream::from_raw_fd(self.socket.as_raw_fd())
-        })
-        .unwrap();
-        let buf = Mapping::page().unwrap();
+#[derive(Debug)]
+pub enum Event {
+    Workspace {
+        id: usize,
+    },
+    CreateWorkspace {
+        id: usize,
+    },
+    DestroyWorkspace {
+        id: usize,
+    },
+    ActiveWindow {
+        class: TinyString,
+        title: TinyString,
+    },
+}
+
+impl Listener {
+    pub async fn listen(mut self, mut dispatch: impl AsyncFnMut(Event)) {
+        let mut buffer = Mapping::page().unwrap();
 
         fn parse_workspace(body: &[u8]) -> Option<usize> {
             let (id, _name) = body.split_once(|&x| x == b',')?;
             usize::from_ascii(id).ok()
         }
 
-        async fn parse_line(line: &[u8], handler: &mut impl Handler) -> Option<()> {
+        async fn parse_line(line: &[u8], dispatch: &mut impl AsyncFnMut(Event)) -> Option<()> {
             let idx = line.iter().position(|&x| x == b'>')?;
             let event_type = unsafe { line.get_unchecked(..idx) };
             let event_body = unsafe { line.get_unchecked(idx + 2..) };
             match event_type {
                 b"workspacev2" => {
-                    handler.workspace(parse_workspace(event_body)?).await;
+                    dispatch(Event::Workspace {
+                        id: parse_workspace(event_body)?,
+                    })
+                    .await;
                     Some(())
                 }
                 b"createworkspacev2" => {
-                    handler.create_workspace(parse_workspace(event_body)?).await;
+                    dispatch(Event::CreateWorkspace {
+                        id: parse_workspace(event_body)?,
+                    })
+                    .await;
                     Some(())
                 }
                 b"destroyworkspacev2" => {
-                    handler
-                        .destroy_workspace(parse_workspace(event_body)?)
-                        .await;
+                    dispatch(Event::DestroyWorkspace {
+                        id: parse_workspace(event_body)?,
+                    })
+                    .await;
                     Some(())
                 }
                 b"activewindow" => {
                     let (class, title) = event_body.split_once(|&x| x == b',')?;
                     let [class, title] =
-                        [class, title].map(|x| unsafe { str::from_utf8_unchecked(x) });
-                    handler.active_window(class, title).await;
+                        [class, title].map(|x| unsafe { str::from_utf8_unchecked(x) }.into());
+                    dispatch(Event::ActiveWindow { class, title }).await;
                     Some(())
                 }
                 _ => None,
@@ -151,30 +120,159 @@ impl Listener<'_> {
         }
 
         loop {
-            stream.readable().await.unwrap();
-            let n = rustix::io::read(stream.as_fd(), buf.as_bytes_mut()).unwrap();
-            let buf = unsafe { buf.as_bytes_mut().get_unchecked(..n) };
+            let BufResult(result, buf) = self.stream.read(buffer).await;
+            buffer = buf;
+            let n = result.unwrap();
+            let buf = unsafe { buffer.as_bytes_mut().get_unchecked(..n) };
 
             for line in buf.split(|&x| x == b'\n') {
-                parse_line(line, &mut handler).await;
+                parse_line(line, &mut dispatch).await;
             }
         }
     }
 }
 
+#[derive(Clone)]
+pub enum Command {
+    Workspace(u8),
+}
+
+#[derive(Clone)]
+pub enum Request {
+    ActiveWindow,
+}
+
+// #[derive(Clone)]
+// pub enum Method {
+//     Command(Command),
+//     Request(Request),
+// }
+
+#[derive(Debug)]
+#[must_use]
+pub enum Response {
+    Raw(String),
+}
+
 impl Controller {
-    async fn request<'a>(self, req: &[u8], res: &'a mut [MaybeUninit<u8>]) -> io::Result<&'a str> {
-        rustix::io::write(&self.socket, req)?;
-        let mut stream = tokio::net::UnixStream::from_std(unsafe {
-            net::UnixStream::from_raw_fd(self.socket.into_raw_fd())
-        })?;
-        let n = stream.read(unsafe { res.assume_init_mut() }).await?;
-        Ok(unsafe { str::from_utf8_unchecked(res.get_unchecked(0..n).assume_init_ref()) })
+    /// similar to request, but requires no response.
+    pub async fn command(mut self, cmd: Command) {
+        let mut buf = Vec::with_capacity(64);
+        match cmd {
+            Command::Workspace(id) => {
+                write!(&mut buf, "q/dispatch workspace {id}").unwrap();
+            }
+        }
+        self.stream.write(buf).await.unwrap();
     }
-    fn request_quiet(self, req: &[u8]) -> io::Result<()> {
-        rustix::io::write(&self.socket, req)?;
-        Ok(())
+
+    pub async fn raw_request(mut self, msg: impl IoBuf) -> String {
+        self.stream.write(msg).await.unwrap();
+
+        let buf = Vec::with_capacity(1024);
+        let BufResult(_, buf) = self.stream.read_to_end(buf).await;
+        unsafe { String::from_utf8_unchecked(buf) }
     }
+
+    pub async fn request(self, req: Request) -> Response {
+        let msg = match req {
+            Request::ActiveWindow => b"activewindow",
+        };
+        let raw = self.raw_request(msg).await;
+        Response::Raw(raw)
+    }
+}
+
+// #[derive(Debug)]
+// pub enum Event {
+//     Message(Message),
+//     Response(Response),
+// }
+
+pub struct Client {
+    pub context: Context,
+    // pub request: Sender<Method>,
+    pub events: Receiver<Event>,
+}
+
+pub struct Server {
+    // context: Context,
+    listener: Listener,
+    // requests: Receiver<Method>,
+    events: Sender<Event>,
+}
+
+impl Server {
+    pub async fn run(self, init: Controller) {
+        let Self {
+            listener,
+            mut events,
+        } = self;
+
+        let res = init
+            .raw_request("[[BATCH]]workspaces;activeworkspace;activewindow")
+            .await;
+        let mut res = res.split("\n\n\n\n\n");
+        if let Some(workspaces) = res.next() {
+            for workspace in workspaces.split("\n\n") {
+                if let Some(id) = parse_workspace_id(workspace) {
+                    events.send(Event::CreateWorkspace { id }).await.unwrap();
+                }
+            }
+        }
+        if let Some(active_workspace) = res.next() {
+            if let Some(id) = parse_workspace_id(active_workspace) {
+                events.send(Event::Workspace { id }).await.unwrap();
+            }
+        }
+        if let Some(active_window) = res.next() {
+            let mut required = 2;
+            let [mut class, mut title] = [TinyString::new(), TinyString::new()];
+            for line in active_window.split("\n") {
+                if line.starts_with("\tclass") {
+                    if let Some(pos) = line.find(' ') {
+                        class = line[pos + 1..].into();
+                        required -= 1;
+                    }
+                } else if line.starts_with("\ttitle") {
+                    if let Some(pos) = line.find(' ') {
+                        title = line[pos + 1..].into();
+                        required -= 1;
+                    }
+                }
+                if required == 0 {
+                    break;
+                }
+            }
+            events
+                .send(Event::ActiveWindow { class, title })
+                .await
+                .unwrap();
+        }
+
+        listener
+            .listen(async |msg| {
+                events.send(msg).await.unwrap();
+            })
+            .await;
+    }
+}
+
+pub async fn new() -> Option<(Server, Client)> {
+    let context = Context::new()?;
+    let listener = context.listener().await;
+    let (sender, receiver) = mpsc::channel(1);
+
+    Some((
+        Server {
+            listener,
+            events: sender,
+        },
+        Client {
+            context,
+            events: receiver,
+        },
+    ))
 }
 
 pub fn parse_workspace_id(data: &str) -> Option<usize> {
@@ -182,8 +280,4 @@ pub fn parse_workspace_id(data: &str) -> Option<usize> {
     let span = data.get(13..)?;
     let pos = span.iter().position(|&x| x == b' ')?;
     usize::from_ascii(&span[..pos]).ok()
-}
-
-pub enum Command {
-    Workspace(u8),
 }

@@ -3,6 +3,11 @@ pub mod mpsc {
 
     pub struct UnboundedSender<T>(mpsc::UnboundedSender<T>);
     pub struct UnboundedReceiver<T>(mpsc::UnboundedReceiver<T>);
+    impl<T> Clone for UnboundedSender<T> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
     impl<T> UnboundedSender<T> {
         #[must_use]
         pub fn send(&self, msg: T) -> Option<()> {
@@ -21,10 +26,20 @@ pub mod mpsc {
 
     pub struct Sender<T>(mpsc::Sender<T>);
     pub struct Receiver<T>(mpsc::Receiver<T>);
+    impl<T> Clone for Sender<T> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
     impl<T> Sender<T> {
         #[must_use]
         pub async fn send(&mut self, msg: T) -> Option<()> {
             self.0.send(msg).await.ok()
+        }
+        #[allow(unused)]
+        #[must_use]
+        pub fn try_send(&mut self, msg: T) -> Option<()> {
+            self.0.try_send(msg).ok()
         }
     }
     impl<T> Receiver<T> {

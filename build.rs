@@ -33,6 +33,7 @@ fn main() {
         .derive_copy(false)
         .new_type_alias("wl_fixed_t")
         .prepend_enum_name(false)
+        .generate_cstr(true)
         .wrap_static_fns(true)
         .headers(headers)
         .blocklist_item("FP_INT_UPWARD")
