@@ -1,12 +1,13 @@
-use std::{cell::RefCell, io::Cursor, num::NonZero, path::Path};
+use std::{fs, io::Cursor, num::NonZero, path::Path};
 
+use arrayvec::ArrayVec;
 use iced::{
-    Border, Font, Length, Padding, Shadow, Theme,
+    Alignment, Border, Font, Length, Padding, Theme,
     alignment::Vertical,
-    widget::{self, button, container, image, mouse_area, row, svg, text},
+    widget::{self, button, container, image, mouse_area, row, svg, text, text::Shaping},
 };
 use lru::LruCache;
-use png::ColorType;
+use png::{BitDepth, ColorType};
 use rustix::{
     fs::{Mode, OFlags},
     mm::{MapFlags, ProtFlags},
@@ -16,11 +17,12 @@ use rustix::{
 use crate::{
     TinyString,
     consumer::{
-        Action, AppEvent,
+        Action, AppEvent, StyleSheet,
         programs::{ColorExt as _, Element, Message, Program, Signal},
+        theme,
     },
     mapping::Mapping,
-    modules::hyprland,
+    modules::{battery, clock, hyprland},
 };
 
 struct BitSet(u16);
@@ -47,41 +49,68 @@ struct WindowInfo {
 }
 
 pub struct Bar {
+    logo: svg::Handle,
+
     workspaces: BitSet,
     workspace_focused: usize,
     window: WindowInfo,
 
-    icon_cache: RefCell<LruCache<TinyString, Option<Handle>, ahash::RandomState>>,
+    battery_icon: Option<Handle>,
+    battery_event: Option<battery::Event>,
+
+    date: ArrayVec<u8, 12>,
+    time: [u8; 8],
+    weekday: &'static str,
+
+    icon_cache: LruCache<TinyString, Option<Handle>, ahash::RandomState>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum Handle {
-    Pixmap(iced_core::image::Handle),
-    Svg(iced_core::svg::Handle),
+    Pixmap(image::Handle),
+    Svg(svg::Handle),
+}
+
+impl Handle {
+    fn load(self) -> Element<'static> {
+        self.load_size(24)
+    }
+    fn load_size(self, size: impl Into<Length> + Copy) -> Element<'static> {
+        match self {
+            Handle::Pixmap(handle) => image(handle).width(size).into(),
+            Handle::Svg(handle) => svg(handle).width(size).height(size).into(),
+        }
+    }
 }
 
 impl Bar {
-    fn load_icon(&self, key: &TinyString) -> Option<Handle> {
-        if key.is_empty() {
-            return None;
-        }
+    fn load_icon(&mut self, key: &TinyString, symbolic: bool) -> Option<Handle> {
         self.icon_cache
-            .borrow_mut()
             .get_or_insert_ref(key, || {
                 cosmic_freedesktop_icons::lookup(key)
-                    .with_size(1024)
+                    .with_size(64)
+                    // .with_theme("Adwaita")
                     .with_theme("Tela-dracula-dark")
+                    // .with_theme("Papirus")
                     .find()
                     .and_then(|path| match path.extension()?.as_encoded_bytes() {
-                        b"svg" => Some(Handle::Svg(iced_core::svg::Handle::from_path(path))),
-                        b"png" => png(path).map(Handle::Pixmap),
+                        b"svg" => {
+                            if symbolic {
+                                load_symbolic(path, &theme()).map(Handle::Svg)
+                            } else {
+                                load_svg(path).map(Handle::Svg)
+                            }
+                        }
+                        b"png" => load_png(path).map(Handle::Pixmap),
                         _ => None,
                     })
             })
             .clone()
     }
     pub fn new() -> Self {
+        let now = clock::Clock::now();
         Self {
+            logo: load_svg("/usr/share/pixmaps/archlinux-logo.svg").unwrap(),
             workspaces: BitSet::new(),
             workspace_focused: usize::MAX,
             window: WindowInfo {
@@ -89,15 +118,17 @@ impl Bar {
                 title: TinyString::new(),
                 icon: None,
             },
-            icon_cache: RefCell::new(LruCache::with_hasher(
-                NonZero::new(16).unwrap(),
-                ahash::RandomState::new(),
-            )),
+            battery_icon: None,
+            battery_event: None,
+            date: now.date(),
+            time: now.time(),
+            weekday: now.weekday(),
+            icon_cache: LruCache::with_hasher(NonZero::new(16).unwrap(), ahash::RandomState::new()),
         }
     }
     fn logo(&self) -> impl Into<Element<'_>> {
         button(
-            svg("/usr/share/pixmaps/archlinux-logo.svg")
+            svg(self.logo.clone())
                 .style(|theme: &Theme, status| svg::Style {
                     color: Some(match status {
                         svg::Status::Idle => theme.palette().text,
@@ -116,7 +147,7 @@ impl Bar {
         let alive = self.workspaces.get(idx);
         let focused = idx == self.workspace_focused;
         let text: Element = if focused {
-            text(id % 10).size(11.5).into()
+            text(id % 10).size(11.5).shaping(Shaping::Basic).into()
         } else {
             match alive {
                 true => text(id % 10).size(11.5),
@@ -157,31 +188,56 @@ impl Bar {
             .align_y(Vertical::Center)
     }
     fn title(&self) -> impl Into<Element<'_>> {
-        let mut row = row([]).align_y(Vertical::Center);
-        if let Some(icon) = self.window.icon.clone() {
-            let icon: Element = match icon {
-                Handle::Pixmap(handle) => image(handle).width(24).into(),
-                Handle::Svg(handle) => svg(handle).width(24).into(),
-            };
-            row = row.push(icon);
-        }
-
-        let inner = row
-            .push(
-                text(self.window.class.as_str())
-                    .style(|theme: &Theme| text::Style {
-                        color: Some(theme.palette().primary),
-                    })
-                    .size(14.5),
-            )
-            .push(text(self.window.title.as_str()))
+        let icon = self.window.icon.clone().map(Handle::load);
+        let class = text(self.window.class.as_str())
+            .style(|theme: &Theme| text::Style {
+                color: Some(theme.palette().primary),
+            })
+            .size(14.5)
+            .shaping(Shaping::Basic);
+        let title = text(self.window.title.as_str());
+        let row = row([icon.into(), class.into(), title.into()])
+            .align_y(Vertical::Center)
             .spacing(5);
 
-        mouse_area(inner)
+        mouse_area(row)
             // .on_enter(Signal::Message(Message::Hello))
             // .on_exit(Signal::Message(Message::Bye))
             .on_enter(Signal::Action(Action::WindowInfo))
-            .on_exit(Signal::Action(Action::CloseWindowInfo))
+            .on_exit(Signal::Action(Action::CloseTooltip))
+    }
+    fn battery(&self) -> Option<Element<'_>> {
+        let icon = self.battery_icon.clone().map(|x| x.load_size(17))?;
+        Some(if let Some(ref e) = self.battery_event {
+            mouse_area(icon)
+                .on_enter(Signal::Action(Action::Battery(e.tooltip())))
+                .on_exit(Signal::Action(Action::CloseTooltip))
+                .into()
+        } else {
+            icon.into()
+        })
+    }
+    fn clock(&self) -> impl Into<Element<'_>> {
+        let date = text(unsafe { str::from_utf8_unchecked(&self.date) })
+            .size(12.5)
+            .height(Length::Fill)
+            .align_y(Alignment::End);
+        let date = container(date)
+            .padding(Padding::default().bottom(7.5))
+            .into();
+        let time = text(unsafe { str::from_utf8_unchecked(&self.time) })
+            .size(17)
+            .height(Length::Fill)
+            .shaping(Shaping::Basic)
+            .center()
+            .width(60)
+            .align_x(Alignment::Center)
+            .into();
+        let weekday = text(self.weekday).size(15).height(Length::Fill).center();
+        let weekday = container(weekday)
+            .padding(Padding::default().bottom(4.5))
+            .into();
+        row([date, time, weekday]).spacing(7)
     }
 }
 
@@ -197,24 +253,18 @@ impl Program for Bar {
         .align_y(Vertical::Center)
         .spacing(7)
         .padding(Padding::new(0.0).left(16))
+        .width(Length::Fill)
         .height(Length::Fill);
 
-        let row = widget::row![left].width(Length::Fill);
-        row.into()
-        // container(row)
-        //     .style(|theme: &Theme| container::Style {
-        //         text_color: None,
-        //         background: Some(theme.palette().background.into()),
-        //         border: Border::default(),
-        //         shadow: Shadow::default(),
-        //         snap: false,
-        //     })
-        //     .into()
+        let right = widget::row![self.battery(), self.clock().into()]
+            .align_y(Vertical::Center)
+            .padding(Padding::new(0.0).right(13))
+            .spacing(9)
+            .height(Length::Fill);
+
+        widget::row![left, right].into()
     }
-    fn update(&mut self, message: Message) {
-        dbg!(message);
-    }
-    fn dispatch(&mut self, event: AppEvent) {
+    fn dispatch(&mut self, event: &AppEvent) {
         match event {
             AppEvent::Hyprland(event) => match event {
                 hyprland::Event::Workspace { id } => self.workspace_focused = id - 1,
@@ -222,17 +272,58 @@ impl Program for Bar {
                 hyprland::Event::DestroyWorkspace { id } => self.workspaces.unset(id - 1),
                 hyprland::Event::ActiveWindow { class, title } => {
                     self.window = WindowInfo {
-                        icon: self.load_icon(&class),
-                        class: truncate(class, 15, "…"),
-                        title: truncate(title, 50, "…"),
+                        icon: if class.is_empty() {
+                            None
+                        } else {
+                            self.load_icon(&class, false)
+                        },
+                        class: truncate(class.clone(), 15, "…"),
+                        title: truncate(title.clone(), 50, "…"),
                     }
                 }
             },
+            AppEvent::Battery(e) => {
+                self.battery_event = Some(e.clone());
+                self.battery_icon = self.load_icon(&e.icon().into(), true);
+            }
+            AppEvent::Clock(e) => {
+                self.date = e.date();
+                self.time = e.time();
+                self.weekday = e.weekday();
+            }
         }
     }
 }
 
-fn png(path: impl AsRef<Path>) -> Option<iced_core::image::Handle> {
+fn load_svg(path: impl AsRef<Path>) -> Option<svg::Handle> {
+    let path = path.as_ref();
+    let fd = rustix::fs::open(path, OFlags::CLOEXEC, Mode::empty()).unwrap();
+    let mapping = Mapping::map(fd, ProtFlags::READ, MapFlags::PRIVATE).unwrap();
+    let text = unsafe { str::from_utf8_unchecked(mapping.as_bytes()) };
+    let tree = usvg::Tree::from_str(text, &usvg::Options::default())
+        .inspect_err(|err| log::warn!("cannot parse {path:?}: {err:?}"))
+        .ok()?;
+    Some(svg::Handle::from_tree(tree))
+}
+
+fn load_symbolic(path: impl AsRef<Path>, theme: &Theme) -> Option<svg::Handle> {
+    let path = path.as_ref();
+    let data = fs::read_to_string(path)
+        .unwrap()
+        .replace("currentColor", &theme.palette().text.to_string());
+    let tree = usvg::Tree::from_str(
+        &data,
+        &usvg::Options {
+            style_sheet: Some(theme.css_injection()),
+            ..Default::default()
+        },
+    )
+    .inspect_err(|err| log::warn!("cannot parse {path:?}: {err:?}"))
+    .ok()?;
+    Some(svg::Handle::from_tree(tree))
+}
+
+fn load_png(path: impl AsRef<Path>) -> Option<image::Handle> {
     let path = path.as_ref();
     let path = path.as_cow_c_str().unwrap();
     let fd = rustix::fs::open(path.as_c_str(), OFlags::CLOEXEC, Mode::empty()).ok()?;
@@ -255,13 +346,13 @@ fn png(path: impl AsRef<Path>) -> Option<iced_core::image::Handle> {
         }
     }
     match info.bit_depth {
-        png::BitDepth::Eight => {}
+        BitDepth::Eight => {}
         x => {
             log::warn!("{path:?} has unsupported {}-bit depth", x as u32);
             return None;
         }
     }
-    let handle = iced_core::image::Handle::from_rgba(info.width, info.height, buf);
+    let handle = image::Handle::from_rgba(info.width, info.height, buf);
     Some(handle)
 }
 

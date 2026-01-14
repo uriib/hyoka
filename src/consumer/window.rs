@@ -11,11 +11,14 @@ use std::{
 
 use iced::{
     Rectangle, Size, Theme,
-    advanced::{clipboard, renderer::Style},
     mouse::{self, Cursor, Interaction},
     window::RedrawRequest,
 };
-use iced_core::widget::Operation;
+use iced_core::{
+    clipboard,
+    renderer::Style,
+    widget::{Operation, operation::Focusable},
+};
 use iced_runtime::user_interface::Cache;
 use iced_tiny_skia::{Renderer, graphics};
 use rustc_hash::FxHashMap;
@@ -27,10 +30,11 @@ use tiny_skia::{Mask, PixmapMut};
 
 use crate::{
     consumer::{
-        Runner,
+        Action, Callbacks, Runner,
         programs::{Element, Program, Signal, UserInterface},
     },
-    wayland::{self, Callback},
+    sync::mpsc::UnboundedSender,
+    wayland::{self, Callback, Event},
 };
 
 #[derive(Clone, Copy)]
@@ -95,21 +99,22 @@ impl Default for ConfigState<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Surface {
     pub role: Role,
     pub surface: WlSurface,
 }
 
-impl Drop for Surface {
+struct OwnedSurface(Surface);
+
+impl Drop for OwnedSurface {
     fn drop(&mut self) {
-        self.role.destroy();
-        unsafe { wayland::ffi::wl_surface_destroy(self.surface.as_ptr()) };
+        self.0.role.destroy();
+        unsafe { wayland::ffi::wl_surface_destroy(self.0.surface.as_ptr()) };
     }
 }
 
-pub struct Inner {
-    surface: Surface,
-
+pub struct State {
     cursor: Cursor,
     serial: Option<u32>,
     shape: Option<Interaction>,
@@ -130,38 +135,33 @@ fn rebuild_ui<'ui>(
     mem::forget(ui);
 }
 
-impl Inner {
+impl State {
     pub fn program(&mut self) -> &mut dyn Program {
         &mut *self.program
     }
-    // pub fn cursor(&self) -> Cursor {
-    //     self.cursor
+    // pub fn rebuild(&mut self, renderer: &mut Renderer) {
+    //     let State {
+    //         config_state,
+    //         program,
+    //         ..
+    //     } = self;
+    //
+    //     if let ConfigState::Configured { ui, buffer, .. } = config_state {
+    //         let [width, height] = buffer.viewport.surface_size;
+    //         rebuild_ui(
+    //             ui as _,
+    //             unsafe { mem::transmute(program.view()) },
+    //             Size::new(width as _, height as _),
+    //             renderer,
+    //         )
+    //     }
     // }
-    pub fn surface(&self) -> &Surface {
-        &self.surface
-    }
-    pub fn rebuild(&mut self, renderer: &mut Renderer) {
-        let Inner {
-            config_state,
-            program,
-            ..
-        } = self;
-
-        if let ConfigState::Configured { ui, buffer, .. } = config_state {
-            let [width, height] = buffer.viewport.surface_size;
-            rebuild_ui(
-                ui as _,
-                unsafe { mem::transmute(program.view()) },
-                Size::new(width as _, height as _),
-                renderer,
-            )
-        }
-    }
     fn redraw(
         &mut self,
         renderer: &mut Renderer,
         theme: &Theme,
         display: NonNull<wayland::ffi::wl_display>,
+        surface: WlSurface,
     ) {
         if let ConfigState::Configured {
             buffer,
@@ -177,12 +177,6 @@ impl Inner {
                 Size::new(width as _, height as _),
                 renderer,
             );
-            // let mut ui = UserInterface::build(
-            //     self.program.view(),
-            //     Size::new(width as _, height as _),
-            //     mem::take(&mut self.cache),
-            //     renderer,
-            // );
             ui.update(
                 &[iced::Event::Window(iced::window::Event::RedrawRequested(
                     Instant::now(),
@@ -200,11 +194,9 @@ impl Inner {
                 },
                 self.cursor,
             );
-            // self.cache = ui.into_cache();
 
             let layers = renderer.layers();
-            let [width, height] = buffer.viewport.surface_size.map(|x| x as _);
-            let bounds = Rectangle::with_size(Size { width, height });
+            // last_layers.take();
             let mut damage = if let Some(last_layers) = last_layers {
                 graphics::damage::diff(
                     &last_layers,
@@ -213,6 +205,8 @@ impl Inner {
                     iced_tiny_skia::Layer::damage,
                 )
             } else {
+                let [width, height] = buffer.viewport.surface_size.map(|x| x as _);
+                let bounds = Rectangle::with_size(Size { width, height });
                 vec![bounds]
             };
             *last_layers = Some(layers.to_vec());
@@ -222,15 +216,18 @@ impl Inner {
                 rect.height = rect.height.ceil();
             }
 
+            // let [width, height] = buffer.viewport.surface_size.map(|x| x as _);
+            // let mut mask = Mask::new(width as _, height as _).unwrap();
             renderer.draw(
                 &mut buffer.pixels(),
                 clip_mask,
+                // &mut mask,
                 &buffer.viewport.to_iced_viewport(),
                 &damage,
                 self.program.background(theme),
             );
 
-            let surface = self.surface.surface.as_ptr();
+            let surface = surface.as_ptr();
             unsafe {
                 wayland::ffi::wl_surface_attach(surface, buffer.buffer.as_ptr(), 0, 0);
                 // let [width, height] = buffer.viewport.buffer_size().map(|x| x as _);
@@ -252,16 +249,21 @@ impl Inner {
 }
 
 #[derive(Clone)]
-pub struct Window(Rc<RefCell<Inner>>);
+pub struct Window(Rc<Inner>);
 
-// impl Window {
-//     fn new(inner: Inner) -> Self {
-//         Self(Rc::new(RefCell::new(inner)))
-//     }
-// }
+pub struct Inner {
+    surface: OwnedSurface,
+    pub state: RefCell<State>,
+}
+
+impl Inner {
+    pub fn surface(&self) -> &Surface {
+        &self.surface.0
+    }
+}
 
 impl Deref for Window {
-    type Target = Rc<RefCell<Inner>>;
+    type Target = Rc<Inner>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -269,28 +271,15 @@ impl Deref for Window {
 
 impl fmt::Debug for Window {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.as_ptr())
+        write!(f, "{:?}", self.surface.0.surface)
     }
 }
-
-// #[derive(Default)]
-// struct Flag {
-//     value: bool,
-// }
-//
-// impl Flag {
-//     fn when_set<F: FnOnce()>(&mut self, f: F) {
-//         if self.value {
-//             f();
-//         }
-//         self.value = false;
-//     }
-// }
 
 #[derive(Default)]
 pub struct WindowManager {
     lut: FxHashMap<NonNull<c_void>, Window>,
     pub focused: Option<WlSurface>,
+    pub subscribers: Vec<Window>,
 }
 
 impl WindowManager {
@@ -299,22 +288,32 @@ impl WindowManager {
         surface: WlSurface,
         role: Role,
         program: Box<dyn Program>,
+        subscribe: bool,
     ) -> &mut Window {
         let window = Window::new(Surface { surface, role }, program);
-        window.borrow().surface.role.key(|k| {
+        if subscribe {
+            self.subscribers.push(window.clone());
+        }
+        window.surface.0.role.key(|k| {
             self.lut.try_insert(k, window.clone()).unwrap();
         });
         self.lut.try_insert(surface.cast(), window).unwrap()
     }
-    pub fn close_window(&mut self, window: impl Deref<Target = Inner>) {
-        if Some(window.surface.surface) == self.focused {
+    pub fn close_window(&mut self, surface: &Surface) {
+        if Some(surface.surface) == self.focused {
             self.focused.take();
         }
+        self.subscribers
+            .iter()
+            .position(|x| x.surface.0.surface == surface.surface)
+            .map(|idx| {
+                self.subscribers.swap_remove(idx);
+            });
 
-        window.surface.role.key(|k| {
+        surface.role.key(|k| {
             self.lut.remove(&k).unwrap();
         });
-        self.lut.remove(&window.surface.surface.cast());
+        self.lut.remove(&surface.surface.cast());
     }
     pub fn find_by_object<T>(&self, obj: NonNull<T>) -> Option<&Window> {
         self.lut.get(&obj.cast())
@@ -333,28 +332,28 @@ impl<T> Index<NonNull<T>> for WindowManager {
 
 impl Window {
     fn new(surface: Surface, program: Box<dyn Program>) -> Self {
-        let inner = Inner {
-            surface,
-            cursor: Cursor::Unavailable,
-            serial: None,
-            shape: None,
-            config_state: ConfigState::default(),
-            program,
-        };
-        Self(Rc::new(RefCell::new(inner)))
+        Self(Rc::new(Inner {
+            surface: OwnedSurface(surface),
+            state: RefCell::new(State {
+                cursor: Cursor::Unavailable,
+                serial: None,
+                shape: None,
+                config_state: ConfigState::default(),
+                program,
+            }),
+        }))
     }
-    pub fn resize(&mut self, size @ [width, height]: [u32; 2], runner: &mut Runner) {
-        let mut window = self.borrow_mut();
+    pub fn resize(&self, size @ [width, height]: [u32; 2], runner: &mut Runner) {
+        let mut window = self.state.borrow_mut();
         match mem::take(&mut window.config_state) {
             ConfigState::Configured { buffer, ui, .. } => {
                 let viewport = buffer.viewport.with_surface_size(size);
                 window.config_state = ConfigState::Configured {
                     buffer: runner.wayland.globals.create_buffer(viewport),
                     ui: ui.relayout(Size::new(width as _, height as _), &mut runner.renderer),
-                    clip_mask: Mask::new(width, height).unwrap(),
+                    clip_mask: viewport.mask(),
                     last_layers: None,
                 };
-                self.request_redraw(window.surface.surface, runner);
             }
             ConfigState::Unconfigured { scale_factor } => {
                 let viewport = Viewport {
@@ -362,27 +361,41 @@ impl Window {
                     buffer_scale: scale_factor,
                     _buffer_transform: wayland::ffi::WL_OUTPUT_TRANSFORM_NORMAL,
                 };
+
+                let buffer = runner.wayland.globals.create_buffer(viewport);
+                unsafe {
+                    wayland::ffi::wl_surface_attach(
+                        self.surface.0.surface.as_ptr(),
+                        buffer.buffer.as_ptr(),
+                        0,
+                        0,
+                    )
+                };
                 window.config_state = ConfigState::Configured {
-                    buffer: runner.wayland.globals.create_buffer(viewport),
+                    buffer,
                     ui: iced_runtime::UserInterface::build(
                         window.program.view(),
                         Size::new(width as _, height as _),
                         Cache::new(),
                         &mut runner.renderer,
                     ),
-                    clip_mask: Mask::new(width, height).unwrap(),
+                    clip_mask: viewport.mask(),
                     last_layers: None,
                 }
                 .forget_lifetime();
-                window.redraw(&mut runner.renderer, &runner.theme, runner.display);
             }
         }
-
+        self.request_redraw(
+            self.surface.0.surface,
+            &mut runner.wayland.notifier,
+            &mut runner.callbacks,
+        );
         unsafe { wayland::ffi::wl_display_flush(runner.display.as_ptr()) };
     }
 
     pub fn rescale(&self, scale: u32, runner: &mut Runner) {
-        let mut window = self.borrow_mut();
+        let mut window = self.state.borrow_mut();
+        let surface = self.surface.0.surface;
         match &mut window.config_state {
             ConfigState::Configured {
                 buffer,
@@ -402,54 +415,68 @@ impl Window {
                 let [width, height] = buffer.viewport.buffer_size();
                 *clip_mask = Mask::new(width, height).unwrap();
                 *last_layers = None;
+
+                dbg!(buffer.viewport);
+                self.request_redraw(surface, &mut runner.wayland.notifier, &mut runner.callbacks);
             }
             ConfigState::Unconfigured { scale_factor } => {
                 *scale_factor = scale;
             }
         }
-
-        let surface = window.surface.surface;
-        unsafe { wayland::ffi::wl_surface_set_buffer_scale(surface.as_ptr(), scale as _) };
-        self.request_redraw(surface, runner);
+        unsafe { wayland::ffi::wl_surface_set_buffer_scale(surface.as_ptr(), scale as _) }
         unsafe { wayland::ffi::wl_display_flush(runner.display.as_ptr()) };
     }
 
-    pub fn request_redraw(&self, surface: WlSurface, runner: &mut Runner) {
+    pub fn request_redraw(
+        &self,
+        surface: WlSurface,
+        notifier: &mut UnboundedSender<Event>,
+        callbacks: &mut Callbacks,
+    ) {
         let callback = unsafe { wayland::ffi::wl_surface_frame(surface.as_ptr()) };
         unsafe {
             wayland::ffi::wl_callback_add_listener(
                 callback,
                 &wayland::CALLBACK_LISTENER,
-                &raw mut *runner.wayland.notifier as _,
+                notifier as *mut _ as _,
             )
         };
         unsafe {
             wayland::ffi::wl_surface_commit(surface.as_ptr());
         };
-        runner.register_callback(Callback::from_raw(callback), {
-            let window = self.clone();
-            move |runner| {
-                window
-                    .borrow_mut()
-                    .redraw(&mut runner.renderer, &runner.theme, runner.display)
-            }
-        });
+
+        let window = self.clone();
+        callbacks
+            .try_insert(
+                Callback::from_raw(callback),
+                Box::new(move |runner| {
+                    window.state.borrow_mut().redraw(
+                        &mut runner.renderer,
+                        &runner.theme,
+                        runner.display,
+                        window.surface.0.surface,
+                    )
+                }),
+            )
+            .map_err(|e| e.entry.remove_entry().0)
+            .unwrap();
     }
 
     pub fn enter(&self, serial: u32) {
-        self.borrow_mut().serial = Some(serial)
+        self.state.borrow_mut().serial = Some(serial);
     }
 
     pub async fn mouse(&self, event: mouse::Event, runner: &mut Runner) {
-        let Inner {
-            surface: Surface { surface, role },
+        let State {
             ref mut cursor,
             ref mut serial,
             ref mut shape,
             ref mut config_state,
             ref mut program,
             ..
-        } = *self.borrow_mut();
+        } = *self.state.borrow_mut();
+
+        let mut messages = vec![];
 
         if let ConfigState::Configured { ui, .. } = config_state {
             match event {
@@ -457,83 +484,74 @@ impl Window {
                     *cursor = Cursor::Available(position);
                 }
                 mouse::Event::CursorLeft => {
-                    eprintln!("leave");
-                    ui.operate(&mut runner.renderer, &mut Leave);
+                    messages.push(Signal::Action(Action::CloseTooltip));
+                    // ui.operate(&mut runner.renderer, &mut Leave);
                     *cursor = Cursor::Unavailable;
                     *serial = None;
                     *shape = None;
                 }
                 _ => {}
             }
-            let mut messages = vec![];
             let state;
+            (state, _) = ui.update(
+                &[iced::Event::Mouse(event)],
+                *cursor,
+                &mut runner.renderer,
+                &mut Clipboard,
+                &mut messages,
+            );
+            if let iced_runtime::user_interface::State::Updated {
+                mouse_interaction,
+                redraw_request,
+                ..
+            } = state
             {
-                // let mut ui = UserInterface::build(
-                //     program.view(),
-                //     Size::new(width as _, height as _),
-                //     mem::take(cache),
-                //     &mut runner.renderer,
-                // );
-                (state, _) = ui.update(
-                    &[iced::Event::Mouse(event)],
-                    *cursor,
-                    &mut runner.renderer,
-                    &mut Clipboard,
-                    &mut messages,
-                );
-            }
-            for message in messages {
-                match message {
-                    Signal::Message(message) => program.update(message),
-                    Signal::Action(action) => {
-                        dbg!(&action);
-                        runner.action(role, *cursor, action).await;
-                        self.request_redraw(surface, runner)
+                if let RedrawRequest::NextFrame = redraw_request {
+                    self.request_redraw(
+                        self.surface.0.surface,
+                        &mut runner.wayland.notifier,
+                        &mut runner.callbacks,
+                    );
+                }
+                if let Some(serial) = *serial
+                    && Some(mouse_interaction) != *shape
+                {
+                    match cursor_shape(mouse_interaction) {
+                        CursorShape::Shape(shape) => unsafe {
+                            wayland::ffi::wp_cursor_shape_device_v1_set_shape(
+                                runner.cursor_shape_device.as_ptr(),
+                                serial,
+                                shape,
+                            )
+                        },
+                        CursorShape::Hide => unsafe {
+                            wayland::ffi::wl_pointer_set_cursor(
+                                runner.pointer.as_ptr(),
+                                serial,
+                                ptr::null_mut(),
+                                0,
+                                0,
+                            );
+                        },
                     }
                 }
             }
-            // dbg!(&state);
-            match state {
-                iced_runtime::user_interface::State::Outdated => {
-                    eprintln!("outdated");
-                }
-                iced_runtime::user_interface::State::Updated {
-                    mouse_interaction,
-                    redraw_request,
-                    ..
-                } => {
-                    if let RedrawRequest::NextFrame = redraw_request {
-                        self.request_redraw(surface, runner)
-                    }
-                    if let Some(serial) = *serial
-                        && Some(mouse_interaction) != *shape
-                    {
-                        match cursor_shape(mouse_interaction) {
-                            CursorShape::Shape(shape) => unsafe {
-                                wayland::ffi::wp_cursor_shape_device_v1_set_shape(
-                                    runner.cursor_shape_device.as_ptr(),
-                                    serial,
-                                    shape,
-                                )
-                            },
-                            CursorShape::Hide => unsafe {
-                                wayland::ffi::wl_pointer_set_cursor(
-                                    runner.pointer.as_ptr(),
-                                    serial,
-                                    ptr::null_mut(),
-                                    0,
-                                    0,
-                                );
-                            },
-                        }
-                    }
-                }
-            }
-            unsafe { wayland::ffi::wl_display_flush(runner.display.as_ptr()) };
         }
+
+        let Surface { role, .. } = self.surface.0;
+        for message in messages {
+            match message {
+                Signal::Message(message) => program.update(message),
+                Signal::Action(action) => {
+                    runner.action(role, *cursor, action).await;
+                }
+            }
+        }
+        unsafe { wayland::ffi::wl_display_flush(runner.display.as_ptr()) };
     }
 }
 
+#[allow(dead_code)]
 struct Leave;
 
 impl Operation for Leave {
@@ -544,7 +562,7 @@ impl Operation for Leave {
         &mut self,
         _id: Option<&iced::widget::Id>,
         _bounds: Rectangle,
-        state: &mut dyn iced_core::widget::operation::Focusable,
+        state: &mut dyn Focusable,
     ) {
         state.unfocus();
     }
@@ -633,7 +651,7 @@ impl clipboard::Clipboard for Clipboard {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Viewport {
     surface_size: [u32; 2],
     buffer_scale: u32,
@@ -669,6 +687,9 @@ impl Viewport {
     fn to_iced_viewport(&self) -> graphics::Viewport {
         let [width, height] = self.buffer_size();
         graphics::Viewport::with_physical_size(Size { width, height }, self.buffer_scale as _)
+    }
+    fn mask(&self) -> Mask {
+        Mask::new(self.buffer_width(), self.buffer_height()).unwrap()
     }
 }
 

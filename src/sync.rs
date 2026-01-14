@@ -36,7 +36,17 @@ pub mod mpsc {
         pub async fn send(&mut self, msg: T) -> Option<()> {
             self.0.send(msg).await.ok()
         }
-        #[allow(unused)]
+        #[allow(dead_code)]
+        #[must_use]
+        pub async fn feed(&mut self, msg: T) -> Option<()> {
+            self.0.feed(msg).await.ok()
+        }
+        #[allow(dead_code)]
+        #[must_use]
+        pub async fn flush(&mut self) -> Option<()> {
+            self.0.flush().await.ok()
+        }
+        #[allow(dead_code)]
         #[must_use]
         pub fn try_send(&mut self, msg: T) -> Option<()> {
             self.0.try_send(msg).ok()
@@ -45,6 +55,14 @@ pub mod mpsc {
     impl<T> Receiver<T> {
         pub async fn receive(&mut self) -> Option<T> {
             self.0.next().await
+        }
+        /// None can be no masage or error
+        #[allow(dead_code)]
+        pub fn try_receive(&mut self) -> Option<T> {
+            match self.0.try_next() {
+                Ok(Some(x)) => Some(x),
+                _ => None,
+            }
         }
     }
     pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {

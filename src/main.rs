@@ -1,10 +1,15 @@
 #![feature(
+    allocator_api,
+    async_iterator,
     future_join,
+    gen_blocks,
     int_from_ascii,
     map_try_insert,
     slice_split_once,
     str_as_str
 )]
+
+use std::{async_iter::AsyncIterator, future, pin::Pin};
 
 use compio::{driver::ProactorBuilder, runtime::Runtime};
 use smallstr::SmallString;
@@ -15,10 +20,14 @@ async fn run() {
     let (wayland_server, wayland) = wayland::new();
 
     let (hyprland_server, hyprland) = hyprland::new().await.split();
-    let init = hyprland.as_ref().unwrap().context.controller().await;
+    let init = if let Some(x) = hyprland.as_ref() {
+        Some(x.context.controller().await)
+    } else {
+        None
+    };
     let hyprland_serve = async {
         match hyprland_server {
-            Some(server) => server.run(init).await,
+            Some(server) => server.run(init.unwrap()).await,
             None => {}
         }
     };
@@ -49,7 +58,6 @@ mod consumer;
 mod mapping;
 mod modules;
 mod sync;
-#[macro_use]
 mod wayland;
 
 pub type TinyString = SmallString<[u8; 16]>;
@@ -67,5 +75,15 @@ impl<X, Y> Split for Option<(X, Y)> {
             Some((x, y)) => (Some(x), Some(y)),
             None => (None, None),
         }
+    }
+}
+
+trait AsyncIteratorExt: AsyncIterator {
+    async fn next(self: Pin<&mut Self>) -> Option<Self::Item>;
+}
+
+impl<T: AsyncIterator> AsyncIteratorExt for T {
+    async fn next(mut self: Pin<&mut Self>) -> Option<Self::Item> {
+        future::poll_fn(|ctx| self.as_mut().poll_next(ctx)).await
     }
 }

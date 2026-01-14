@@ -142,12 +142,6 @@ pub enum Request {
     ActiveWindow,
 }
 
-// #[derive(Clone)]
-// pub enum Method {
-//     Command(Command),
-//     Request(Request),
-// }
-
 #[derive(Debug)]
 #[must_use]
 pub enum Response {
@@ -183,30 +177,21 @@ impl Controller {
     }
 }
 
-// #[derive(Debug)]
-// pub enum Event {
-//     Message(Message),
-//     Response(Response),
-// }
-
 pub struct Client {
     pub context: Context,
-    // pub request: Sender<Method>,
     pub events: Receiver<Event>,
 }
 
 pub struct Server {
-    // context: Context,
     listener: Listener,
-    // requests: Receiver<Method>,
-    events: Sender<Event>,
+    notifier: Sender<Event>,
 }
 
 impl Server {
     pub async fn run(self, init: Controller) {
         let Self {
             listener,
-            mut events,
+            mut notifier,
         } = self;
 
         let res = init
@@ -216,13 +201,13 @@ impl Server {
         if let Some(workspaces) = res.next() {
             for workspace in workspaces.split("\n\n") {
                 if let Some(id) = parse_workspace_id(workspace) {
-                    events.send(Event::CreateWorkspace { id }).await.unwrap();
+                    notifier.feed(Event::CreateWorkspace { id }).await.unwrap();
                 }
             }
         }
         if let Some(active_workspace) = res.next() {
             if let Some(id) = parse_workspace_id(active_workspace) {
-                events.send(Event::Workspace { id }).await.unwrap();
+                notifier.feed(Event::Workspace { id }).await.unwrap();
             }
         }
         if let Some(active_window) = res.next() {
@@ -244,15 +229,16 @@ impl Server {
                     break;
                 }
             }
-            events
-                .send(Event::ActiveWindow { class, title })
+            notifier
+                .feed(Event::ActiveWindow { class, title })
                 .await
                 .unwrap();
         }
+        notifier.flush().await.unwrap();
 
         listener
             .listen(async |msg| {
-                events.send(msg).await.unwrap();
+                notifier.send(msg).await.unwrap();
             })
             .await;
     }
@@ -261,12 +247,12 @@ impl Server {
 pub async fn new() -> Option<(Server, Client)> {
     let context = Context::new()?;
     let listener = context.listener().await;
-    let (sender, receiver) = mpsc::channel(1);
+    let (sender, receiver) = mpsc::channel(3);
 
     Some((
         Server {
             listener,
-            events: sender,
+            notifier: sender,
         },
         Client {
             context,

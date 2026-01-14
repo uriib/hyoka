@@ -1,23 +1,32 @@
-use std::ptr::{self, NonNull};
+use std::{
+    pin,
+    ptr::{self, NonNull},
+    time::{Duration, Instant},
+};
 
 use iced::{
     Color, Font, Pixels, Point, Size, Theme, color,
-    font::{Family, Stretch, Style::Normal, Weight},
+    font::{Family, Stretch, Style, Weight},
     mouse::Cursor,
+    theme::Palette,
 };
 use iced_core::{layout::Limits, widget::Tree};
 use iced_tiny_skia::Renderer;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Split,
+    AsyncIteratorExt as _, Split, TinyString,
     consumer::{
-        programs::{Bar, Program, WindowInfo},
+        programs::{Bar, Program, tooltip},
         window::{Role, Window, WindowManager},
     },
-    modules::hyprland,
+    modules::{
+        battery,
+        clock::{self, Clock},
+        hyprland,
+    },
     sync::mpsc::channel,
-    wayland::{self, Callback},
+    wayland,
 };
 
 const BAR_HEIGHT: u32 = 35;
@@ -31,13 +40,16 @@ enum Event {
 #[derive(Debug)]
 pub enum AppEvent {
     Hyprland(hyprland::Event),
+    Battery(battery::Event),
+    Clock(clock::Clock),
 }
 
 #[derive(Debug, Clone)]
 pub enum Action {
     Workspace { id: u8 },
     WindowInfo,
-    CloseWindowInfo,
+    Battery(TinyString),
+    CloseTooltip,
 }
 
 pub struct Consumer {
@@ -57,7 +69,7 @@ impl Consumer {
             display,
             hyprland,
         } = self;
-        let (notifier, mut receiver) = channel(1);
+        let (mut notifier, mut receiver) = channel(4);
 
         let mut sender = notifier.clone();
         let wayland = async move {
@@ -76,6 +88,12 @@ impl Consumer {
         let mut sender = notifier.clone();
         let hyprland = async move {
             if let Some(mut events) = hyprland_events {
+                while let Some(e) = events.try_receive() {
+                    sender
+                        .feed(Event::App(AppEvent::Hyprland(e)))
+                        .await
+                        .unwrap();
+                }
                 loop {
                     sender
                         .send(Event::App(AppEvent::Hyprland(
@@ -87,10 +105,57 @@ impl Consumer {
             }
         };
 
-        let mut runner = Runner::new(wayland_proxy, display, hyprctl);
+        let events = notifier.clone();
+        let battery_serve = async move {
+            let mut sender = events.clone();
+            if let Some((e, name, uevent)) = battery::init().unwrap() {
+                sender.feed(Event::App(AppEvent::Battery(e))).await.unwrap();
+                let mut listener = battery::Listener::new(name).unwrap();
 
+                let mut it = pin::pin!(listener.listen());
+                let listen = async {
+                    loop {
+                        let e = it.as_mut().next().await.unwrap();
+                        sender.send(Event::App(AppEvent::Battery(e))).await.unwrap();
+                    }
+                };
+
+                let mut sender = events.clone();
+                let poll = async {
+                    loop {
+                        if let Some(e) = uevent.poll() {
+                            sender.send(Event::App(AppEvent::Battery(e))).await.unwrap();
+                        }
+                        let seconds = match e.status {
+                            battery::Status::Full | battery::Status::Charging => 3,
+                            _ => 6,
+                        };
+                        compio::time::sleep(Duration::from_secs(seconds)).await;
+                    }
+                };
+
+                std::future::join!(listen, poll).await;
+            }
+        };
+
+        let mut sender = notifier.clone();
+        let clock = async move {
+            let interval = Duration::from_secs(1);
+            let mut timer = compio::time::interval_at(Instant::now() + interval, interval);
+            loop {
+                timer.tick().await;
+                sender
+                    .send(Event::App(AppEvent::Clock(Clock::now())))
+                    .await
+                    .unwrap();
+            }
+        };
+
+        notifier.flush().await.unwrap();
+        let mut runner = Runner::new(wayland_proxy, display, hyprctl);
         let consumer = async move {
             loop {
+                // TODO: dispatch all pending events at once
                 match receiver.receive().await.unwrap() {
                     Event::Wayland(event) => {
                         runner.dispatch_wayland(event).await;
@@ -100,7 +165,7 @@ impl Consumer {
             }
         };
 
-        std::future::join!(wayland, consumer, hyprland).await;
+        std::future::join!(wayland, consumer, hyprland, battery_serve, clock).await;
     }
 }
 
@@ -108,11 +173,10 @@ type Callbacks = FxHashMap<wayland::Callback, Box<dyn FnOnce(&mut Runner)>>;
 
 struct Runner {
     wayland: wayland::Proxy,
-    display: NonNull<wayland::ffi::wl_display>,
     hyprctl: Option<hyprland::Context>,
 
     window_manager: WindowManager,
-
+    display: NonNull<wayland::ffi::wl_display>,
     pointer: NonNull<wayland::ffi::wl_pointer>,
     cursor_shape_device: NonNull<wayland::ffi::wp_cursor_shape_device_v1>,
 
@@ -120,7 +184,6 @@ struct Runner {
     theme: Theme,
     callbacks: Callbacks,
 
-    bar: Window,
     tooltip: Option<Window>,
 }
 
@@ -167,12 +230,13 @@ impl Runner {
 
             wayland::ffi::wl_display_flush(display.as_ptr());
         }
-        let bar = window_manager.create_window(
+        window_manager.create_window(
             NonNull::new(surface).unwrap(),
             Role::Layer {
                 layer_surface: NonNull::new(layer_surface).unwrap(),
             },
             Box::new(Bar::new()),
+            true,
         );
 
         let pointer = unsafe { wayland::ffi::wl_seat_get_pointer(wayland.globals.seat()) };
@@ -194,15 +258,14 @@ impl Runner {
             wayland,
             display,
             hyprctl,
-            bar: bar.clone(),
             tooltip: None,
             window_manager,
             renderer: Renderer::new(
                 Font {
-                    family: Family::SansSerif,
-                    weight: Weight::Semibold,
+                    family: Family::Name("SF Pro Display"),
+                    weight: Weight::Normal,
                     stretch: Stretch::Normal,
-                    style: Normal,
+                    style: Style::Normal,
                 },
                 Pixels(15.5),
             ),
@@ -211,12 +274,6 @@ impl Runner {
             cursor_shape_device: NonNull::new(cursor_shape_device).unwrap(),
             callbacks: Default::default(),
         }
-    }
-    fn register_callback(&mut self, cb: Callback, f: impl FnOnce(&mut Self) + 'static) {
-        self.callbacks
-            .try_insert(cb, Box::new(f))
-            .map_err(|e| e.entry.remove_entry().0)
-            .unwrap();
     }
     async fn dispatch_wayland(&mut self, event: wayland::Event) -> Option<()> {
         match event {
@@ -236,16 +293,6 @@ impl Runner {
                 let win = self.window_manager.find_by_object(surface)?.clone();
                 win.mouse(iced::mouse::Event::CursorEntered, self).await;
                 win.enter(serial);
-                // if let Some(old) = self
-                //     .window_manager
-                //     .focused
-                //     .replace(surface)
-                //     .and_then(|x| self.window_manager.find_by_object(x))
-                // {
-                //     old.clone()
-                //         .mouse(iced::mouse::Event::CursorLeft, self)
-                //         .await;
-                // }
                 self.window_manager.focused = Some(surface);
             }
             wayland::Event::Mouse(event) => {
@@ -263,14 +310,14 @@ impl Runner {
         Some(())
     }
     fn dispatch_app_event(&mut self, event: AppEvent) {
-        let bar = self.bar.clone();
-        let surface = {
-            let mut bar = bar.borrow_mut();
-            bar.program().dispatch(event);
-            bar.rebuild(&mut self.renderer);
-            bar.surface().surface
-        };
-        bar.request_redraw(surface, self);
+        for window in &self.window_manager.subscribers {
+            window.state.borrow_mut().program().dispatch(&event);
+            window.request_redraw(
+                window.surface().surface,
+                &mut self.wayland.notifier,
+                &mut self.callbacks,
+            );
+        }
         unsafe {
             wayland::ffi::wl_display_flush(self.display.as_ptr());
         }
@@ -286,8 +333,8 @@ impl Runner {
                     .await;
             }
             Action::WindowInfo => {
-                if self.tooltip.is_some() {
-                    return None;
+                if let Some(win) = self.tooltip.take() {
+                    self.window_manager.close_window(win.surface());
                 }
                 let res = match self
                     .hyprctl
@@ -302,16 +349,32 @@ impl Runner {
                 if let Cursor::Available(Point { x, .. }) = cursor {
                     self.tooltip = self
                         .popup(
-                            Box::new(WindowInfo::new(res)),
+                            Box::new(tooltip::WindowInfo::new(res.replace("\t", "        "))),
                             [x as _, BAR_HEIGHT + 1],
                             role,
+                            false,
                         )
                         .map(|x| x.clone());
                 }
             }
-            Action::CloseWindowInfo => {
+            Action::Battery(init) => {
                 if let Some(win) = self.tooltip.take() {
-                    self.window_manager.close_window(win.borrow());
+                    self.window_manager.close_window(win.surface());
+                }
+                if let Cursor::Available(Point { x, .. }) = cursor {
+                    self.tooltip = self
+                        .popup(
+                            Box::new(tooltip::Battery { content: init }),
+                            [x as _, BAR_HEIGHT + 1],
+                            role,
+                            true,
+                        )
+                        .map(|x| x.clone());
+                }
+            }
+            Action::CloseTooltip => {
+                if let Some(win) = self.tooltip.take() {
+                    self.window_manager.close_window(win.surface());
                 }
             }
         }
@@ -322,6 +385,7 @@ impl Runner {
         program: Box<dyn Program>,
         [x, y]: [u32; 2],
         parent: Role,
+        subscribe: bool,
     ) -> Option<&Window> {
         let Size { width, height } = {
             let mut view = program.view();
@@ -420,12 +484,13 @@ impl Runner {
                 positioner: NonNull::new(positioner).unwrap(),
             },
             program,
+            subscribe,
         );
         Some(win)
     }
 }
 
-const BACKGROUND: Color = Color::from_rgba8(29, 25, 36, 0.38);
+const BACKGROUND: Color = Color::from_rgba8(30, 28, 34, 0.38);
 
 const PURPLE: Color = color!(0xa476f7);
 const WHITE: Color = color!(0xcdd6f5);
@@ -436,7 +501,7 @@ const RED: Color = color!(0xf25b4f);
 pub fn theme() -> Theme {
     Theme::custom(
         "paper dark",
-        iced::theme::Palette {
+        Palette {
             background: BACKGROUND,
             text: WHITE,
             primary: PURPLE,
@@ -445,6 +510,34 @@ pub fn theme() -> Theme {
             danger: RED,
         },
     )
+}
+
+trait StyleSheet {
+    fn css_injection(&self) -> String;
+}
+// foreground’, ‘success’, ‘warning’, ‘error’, ‘accent’
+impl StyleSheet for Theme {
+    fn css_injection(&self) -> String {
+        let Palette {
+            text,
+            primary,
+            success,
+            warning,
+            danger,
+            ..
+        } = self.palette();
+        format!(
+            concat!(
+                "* {{ fill:{} }}",
+                ".foreground {{ fill:{} }}",
+                ".success {{ fill:{} }}",
+                ".warning {{ fill:{} }}",
+                ".error {{ fill:{} }}",
+                ".accent {{ fill:{} }}",
+            ),
+            text, text, success, warning, danger, primary
+        )
+    }
 }
 
 mod programs;

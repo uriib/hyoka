@@ -12,7 +12,12 @@ use iced::{Point, mouse};
 
 use crate::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
-#[allow(non_camel_case_types, non_upper_case_globals, unused)]
+#[allow(
+    dead_code,
+    non_camel_case_types,
+    non_upper_case_globals,
+    unsafe_op_in_unsafe_fn
+)]
 pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
@@ -119,7 +124,7 @@ impl Fixed {
     fn as_f32(self) -> f32 {
         (self.0 as f32) / 256.0
     }
-    #[allow(unused)]
+    #[allow(dead_code)]
     fn as_i32(self) -> i32 {
         self.0 / 256
     }

@@ -1,4 +1,5 @@
 use std::{
+    alloc, mem,
     os::fd::AsFd,
     ptr::{self, NonNull},
     slice,
@@ -56,6 +57,21 @@ impl<S: Size> Mapping<S> {
     pub fn as_bytes_mut(&self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len.size()) }
     }
+    #[allow(dead_code)]
+    fn into_boxed_slice(self) -> Box<[u8], Allocator> {
+        let res = unsafe {
+            Box::from_non_null_in(
+                NonNull::slice_from_raw_parts(self.ptr, self.len.size()),
+                Allocator,
+            )
+        };
+        mem::forget(self);
+        res
+    }
+    #[allow(dead_code)]
+    fn into_vec(self) -> Vec<u8, Allocator> {
+        self.into_boxed_slice().into_vec()
+    }
 }
 
 impl Mapping<usize> {
@@ -102,42 +118,6 @@ impl<S: Size> SetBufInit for Mapping<S> {
     unsafe fn set_buf_init(&mut self, _len: usize) {}
 }
 
-// struct Buffer<S: Size> {
-//     mapping: Mapping<S>,
-//     len: usize,
-// }
-//
-// impl<S: Size> Buffer<S> {
-//     fn new(mapping: Mapping<S>) -> Self {
-//         Self { mapping, len: 0 }
-//     }
-// }
-//
-// unsafe impl<S: Size> IoBufMut for Buffer<S> {
-//     fn as_buf_mut_ptr(&mut self) -> *mut u8 {
-//         self.mapping.ptr.as_ptr()
-//     }
-// }
-//
-// unsafe impl<S: Size> IoBuf for Buffer<S> {
-//     fn as_buf_ptr(&self) -> *const u8 {
-//         self.mapping.ptr.as_ptr()
-//     }
-//
-//     // use it to read only once
-//     fn buf_len(&self) -> usize {
-//         0
-//     }
-//
-//     fn buf_capacity(&self) -> usize {
-//         self.len.size()
-//     }
-// }
-//
-// impl<S: Size> SetBufInit for Buffer<S> {
-//     unsafe fn set_buf_init(&mut self, _len: usize) {}
-// }
-
 impl<S: Size> AsRef<[u8]> for Mapping<S> {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
@@ -149,5 +129,31 @@ unsafe impl<S: Size> Send for Mapping<S> {}
 impl<S: Size> Into<Bytes> for Mapping<S> {
     fn into(self) -> Bytes {
         Bytes::from_owner(self)
+    }
+}
+
+#[allow(dead_code)]
+pub struct Allocator;
+
+unsafe impl alloc::Allocator for Allocator {
+    fn allocate(&self, layout: alloc::Layout) -> Result<NonNull<[u8]>, alloc::AllocError> {
+        unsafe {
+            rustix::mm::mmap_anonymous(
+                ptr::null_mut(),
+                layout.size(),
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+            )
+        }
+        .map(|ptr| unsafe {
+            NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr as _), layout.size())
+        })
+        .map_err(|_| alloc::AllocError)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: alloc::Layout) {
+        unsafe {
+            rustix::mm::munmap(ptr.cast().as_mut(), layout.size()).unwrap_unchecked();
+        }
     }
 }
