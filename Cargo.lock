@@ -746,6 +746,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
+name = "derive-where"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef941ded77d15ca19b40374869ac6000af1c9f2a4c0f3d4c70926287e6364a8f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1142,8 +1153,11 @@ dependencies = [
  "compio",
  "concat-idents",
  "cosmic-freedesktop-icons",
+ "derive-where",
+ "futures",
  "iced",
  "iced_core",
+ "iced_program",
  "iced_runtime",
  "iced_tiny_skia",
  "log",

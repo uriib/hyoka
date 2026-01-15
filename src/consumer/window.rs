@@ -9,6 +9,7 @@ use std::{
     time::Instant,
 };
 
+use futures::channel::mpsc::UnboundedSender;
 use iced::{
     Rectangle, Size, Theme,
     mouse::{self, Cursor, Interaction},
@@ -33,7 +34,6 @@ use crate::{
         Action, Callbacks, Runner,
         programs::{Element, Program, Signal, UserInterface},
     },
-    sync::mpsc::UnboundedSender,
     wayland::{self, Callback, Event},
 };
 
@@ -68,8 +68,8 @@ impl Role {
     }
     fn key(&self, mut cb: impl FnMut(NonNull<c_void>)) {
         match self {
-            &Role::Layer { layer_surface } => cb(unsafe { mem::transmute(layer_surface) }),
-            &Role::Popup { popup, .. } => cb(unsafe { mem::transmute(popup) }),
+            &Role::Layer { layer_surface } => cb(layer_surface.cast()),
+            &Role::Popup { popup, .. } => cb(popup.cast()),
         }
     }
 }
@@ -88,11 +88,6 @@ enum ConfigState<'ui> {
     },
 }
 
-impl ConfigState<'_> {
-    fn forget_lifetime(self) -> ConfigState<'static> {
-        unsafe { mem::transmute(self) }
-    }
-}
 impl Default for ConfigState<'_> {
     fn default() -> Self {
         Self::Unconfigured { scale_factor: 1 }
@@ -119,6 +114,7 @@ pub struct State {
     serial: Option<u32>,
     shape: Option<Interaction>,
     config_state: ConfigState<'static>,
+    renderer: Renderer,
 
     program: Box<dyn Program>,
 }
@@ -139,26 +135,8 @@ impl State {
     pub fn program(&mut self) -> &mut dyn Program {
         &mut *self.program
     }
-    // pub fn rebuild(&mut self, renderer: &mut Renderer) {
-    //     let State {
-    //         config_state,
-    //         program,
-    //         ..
-    //     } = self;
-    //
-    //     if let ConfigState::Configured { ui, buffer, .. } = config_state {
-    //         let [width, height] = buffer.viewport.surface_size;
-    //         rebuild_ui(
-    //             ui as _,
-    //             unsafe { mem::transmute(program.view()) },
-    //             Size::new(width as _, height as _),
-    //             renderer,
-    //         )
-    //     }
-    // }
     fn redraw(
         &mut self,
-        renderer: &mut Renderer,
         theme: &Theme,
         display: NonNull<wayland::ffi::wl_display>,
         surface: WlSurface,
@@ -175,19 +153,19 @@ impl State {
                 ui,
                 unsafe { mem::transmute(self.program.view()) },
                 Size::new(width as _, height as _),
-                renderer,
+                &mut self.renderer,
             );
             ui.update(
                 &[iced::Event::Window(iced::window::Event::RedrawRequested(
                     Instant::now(),
                 ))],
                 self.cursor,
-                renderer,
+                &mut self.renderer,
                 &mut Clipboard,
                 &mut vec![],
             );
             ui.draw(
-                renderer,
+                &mut self.renderer,
                 theme,
                 &Style {
                     text_color: theme.palette().text,
@@ -195,8 +173,7 @@ impl State {
                 self.cursor,
             );
 
-            let layers = renderer.layers();
-            // last_layers.take();
+            let layers = self.renderer.layers();
             let mut damage = if let Some(last_layers) = last_layers {
                 graphics::damage::diff(
                     &last_layers,
@@ -216,12 +193,9 @@ impl State {
                 rect.height = rect.height.ceil();
             }
 
-            // let [width, height] = buffer.viewport.surface_size.map(|x| x as _);
-            // let mut mask = Mask::new(width as _, height as _).unwrap();
-            renderer.draw(
+            self.renderer.draw(
                 &mut buffer.pixels(),
                 clip_mask,
-                // &mut mask,
                 &buffer.viewport.to_iced_viewport(),
                 &damage,
                 self.program.background(theme),
@@ -287,10 +261,11 @@ impl WindowManager {
         &mut self,
         surface: WlSurface,
         role: Role,
+        renderer: Renderer,
         program: Box<dyn Program>,
         subscribe: bool,
     ) -> &mut Window {
-        let window = Window::new(Surface { surface, role }, program);
+        let window = Window::new(Surface { surface, role }, renderer, program);
         if subscribe {
             self.subscribers.push(window.clone());
         }
@@ -331,7 +306,7 @@ impl<T> Index<NonNull<T>> for WindowManager {
 }
 
 impl Window {
-    fn new(surface: Surface, program: Box<dyn Program>) -> Self {
+    fn new(surface: Surface, renderer: Renderer, program: Box<dyn Program>) -> Self {
         Self(Rc::new(Inner {
             surface: OwnedSurface(surface),
             state: RefCell::new(State {
@@ -339,6 +314,7 @@ impl Window {
                 serial: None,
                 shape: None,
                 config_state: ConfigState::default(),
+                renderer,
                 program,
             }),
         }))
@@ -350,7 +326,7 @@ impl Window {
                 let viewport = buffer.viewport.with_surface_size(size);
                 window.config_state = ConfigState::Configured {
                     buffer: runner.wayland.globals.create_buffer(viewport),
-                    ui: ui.relayout(Size::new(width as _, height as _), &mut runner.renderer),
+                    ui: ui.relayout(Size::new(width as _, height as _), &mut window.renderer),
                     clip_mask: viewport.mask(),
                     last_layers: None,
                 };
@@ -373,16 +349,15 @@ impl Window {
                 };
                 window.config_state = ConfigState::Configured {
                     buffer,
-                    ui: iced_runtime::UserInterface::build(
-                        window.program.view(),
+                    ui: iced_runtime::UserInterface::build::<Element<'static>>(
+                        unsafe { mem::transmute(window.program.view()) },
                         Size::new(width as _, height as _),
                         Cache::new(),
-                        &mut runner.renderer,
+                        &mut window.renderer,
                     ),
                     clip_mask: viewport.mask(),
                     last_layers: None,
-                }
-                .forget_lifetime();
+                };
             }
         }
         self.request_redraw(
@@ -416,7 +391,6 @@ impl Window {
                 *clip_mask = Mask::new(width, height).unwrap();
                 *last_layers = None;
 
-                dbg!(buffer.viewport);
                 self.request_redraw(surface, &mut runner.wayland.notifier, &mut runner.callbacks);
             }
             ConfigState::Unconfigured { scale_factor } => {
@@ -451,7 +425,6 @@ impl Window {
                 Callback::from_raw(callback),
                 Box::new(move |runner| {
                     window.state.borrow_mut().redraw(
-                        &mut runner.renderer,
                         &runner.theme,
                         runner.display,
                         window.surface.0.surface,
@@ -473,7 +446,7 @@ impl Window {
             ref mut shape,
             ref mut config_state,
             ref mut program,
-            ..
+            ref mut renderer,
         } = *self.state.borrow_mut();
 
         let mut messages = vec![];
@@ -496,7 +469,7 @@ impl Window {
             (state, _) = ui.update(
                 &[iced::Event::Mouse(event)],
                 *cursor,
-                &mut runner.renderer,
+                renderer,
                 &mut Clipboard,
                 &mut messages,
             );

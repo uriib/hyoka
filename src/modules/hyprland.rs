@@ -6,12 +6,12 @@ use compio::{
     io::{AsyncRead as _, AsyncReadExt, AsyncWrite as _},
     net::UnixStream,
 };
-
-use crate::{
-    TinyString,
-    mapping::Mapping,
-    sync::mpsc::{self, Receiver, Sender},
+use futures::{
+    SinkExt as _,
+    channel::mpsc::{self, Receiver, Sender},
 };
+
+use crate::{TinyString, mapping::Mapping};
 
 fn xdg_runtime_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR")

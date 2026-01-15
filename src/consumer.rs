@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::{SinkExt as _, StreamExt as _, channel::mpsc::channel};
 use iced::{
     Color, Font, Pixels, Point, Size, Theme, color,
     font::{Family, Stretch, Style, Weight},
@@ -15,7 +16,7 @@ use iced_tiny_skia::Renderer;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    AsyncIteratorExt as _, Split, TinyString,
+    Split, TinyString,
     consumer::{
         programs::{Bar, Program, tooltip},
         window::{Role, Window, WindowManager},
@@ -25,7 +26,6 @@ use crate::{
         clock::{self, Clock},
         hyprland,
     },
-    sync::mpsc::channel,
     wayland,
 };
 
@@ -75,7 +75,7 @@ impl Consumer {
         let wayland = async move {
             loop {
                 sender
-                    .send(Event::Wayland(wayland_events.receive().await.unwrap()))
+                    .send(Event::Wayland(wayland_events.next().await.unwrap()))
                     .await
                     .unwrap();
             }
@@ -88,17 +88,15 @@ impl Consumer {
         let mut sender = notifier.clone();
         let hyprland = async move {
             if let Some(mut events) = hyprland_events {
-                while let Some(e) = events.try_receive() {
+                while let Ok(e) = events.try_next() {
                     sender
-                        .feed(Event::App(AppEvent::Hyprland(e)))
+                        .feed(Event::App(AppEvent::Hyprland(e.unwrap())))
                         .await
                         .unwrap();
                 }
                 loop {
                     sender
-                        .send(Event::App(AppEvent::Hyprland(
-                            events.receive().await.unwrap(),
-                        )))
+                        .send(Event::App(AppEvent::Hyprland(events.next().await.unwrap())))
                         .await
                         .unwrap();
                 }
@@ -112,12 +110,14 @@ impl Consumer {
                 sender.feed(Event::App(AppEvent::Battery(e))).await.unwrap();
                 let mut listener = battery::Listener::new(name).unwrap();
 
-                let mut it = pin::pin!(listener.listen());
                 let listen = async {
-                    loop {
-                        let e = it.as_mut().next().await.unwrap();
-                        sender.send(Event::App(AppEvent::Battery(e))).await.unwrap();
-                    }
+                    pin::pin!(crate::stream(listener.listen()))
+                        .map(AppEvent::Battery)
+                        .map(Event::App)
+                        .map(Ok)
+                        .forward(sender)
+                        .await
+                        .unwrap();
                 };
 
                 let mut sender = events.clone();
@@ -156,7 +156,7 @@ impl Consumer {
         let consumer = async move {
             loop {
                 // TODO: dispatch all pending events at once
-                match receiver.receive().await.unwrap() {
+                match receiver.next().await.unwrap() {
                     Event::Wayland(event) => {
                         runner.dispatch_wayland(event).await;
                     }
@@ -180,7 +180,6 @@ struct Runner {
     pointer: NonNull<wayland::ffi::wl_pointer>,
     cursor_shape_device: NonNull<wayland::ffi::wp_cursor_shape_device_v1>,
 
-    renderer: Renderer,
     theme: Theme,
     callbacks: Callbacks,
 
@@ -235,6 +234,7 @@ impl Runner {
             Role::Layer {
                 layer_surface: NonNull::new(layer_surface).unwrap(),
             },
+            renderer(),
             Box::new(Bar::new()),
             true,
         );
@@ -260,15 +260,6 @@ impl Runner {
             hyprctl,
             tooltip: None,
             window_manager,
-            renderer: Renderer::new(
-                Font {
-                    family: Family::Name("SF Pro Display"),
-                    weight: Weight::Normal,
-                    stretch: Stretch::Normal,
-                    style: Style::Normal,
-                },
-                Pixels(15.5),
-            ),
             theme: theme(),
             pointer: NonNull::new(pointer).unwrap(),
             cursor_shape_device: NonNull::new(cursor_shape_device).unwrap(),
@@ -387,12 +378,13 @@ impl Runner {
         parent: Role,
         subscribe: bool,
     ) -> Option<&Window> {
+        let mut renderer = renderer();
         let Size { width, height } = {
             let mut view = program.view();
             let mut tree = Tree::new(&view);
             let node = view.as_widget_mut().layout(
                 &mut tree,
-                &mut self.renderer,
+                &mut renderer,
                 &Limits::new(Size::ZERO, Size::INFINITE),
             );
             node.bounds().size()
@@ -483,6 +475,7 @@ impl Runner {
                 popup: NonNull::new(popup).unwrap(),
                 positioner: NonNull::new(positioner).unwrap(),
             },
+            renderer,
             program,
             subscribe,
         );
@@ -509,6 +502,18 @@ pub fn theme() -> Theme {
             warning: YELLOW,
             danger: RED,
         },
+    )
+}
+
+pub fn renderer() -> iced_tiny_skia::Renderer {
+    Renderer::new(
+        Font {
+            family: Family::Name("SF Pro Display"),
+            weight: Weight::Normal,
+            stretch: Stretch::Normal,
+            style: Style::Normal,
+        },
+        Pixels(15.5),
     )
 }
 

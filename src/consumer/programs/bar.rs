@@ -49,8 +49,6 @@ struct WindowInfo {
 }
 
 pub struct Bar {
-    logo: svg::Handle,
-
     workspaces: BitSet,
     workspace_focused: usize,
     window: WindowInfo,
@@ -110,7 +108,6 @@ impl Bar {
     pub fn new() -> Self {
         let now = clock::Clock::now();
         Self {
-            logo: load_svg("/usr/share/pixmaps/archlinux-logo.svg").unwrap(),
             workspaces: BitSet::new(),
             workspace_focused: usize::MAX,
             window: WindowInfo {
@@ -128,7 +125,7 @@ impl Bar {
     }
     fn logo(&self) -> impl Into<Element<'_>> {
         button(
-            svg(self.logo.clone())
+            svg("/usr/share/pixmaps/archlinux-logo.svg")
                 .style(|theme: &Theme, status| svg::Style {
                     color: Some(match status {
                         svg::Status::Idle => theme.palette().text,

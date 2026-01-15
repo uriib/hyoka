@@ -20,6 +20,8 @@ compio = { version = "0.17.0", default-features = false, features = [
 ] }
 concat-idents = "1.1.5"
 cosmic-freedesktop-icons = { git = "https://github.com/pop-os/freedesktop-icons" }
+derive-where = "1.6.0"
+futures = { version = "0.3.31", features = ["unstable"] }
 iced = { git = "https://github.com/uriib/iced", default-features = false, features = [
   "image-without-codecs",
   "svg",
@@ -28,6 +30,7 @@ iced = { git = "https://github.com/uriib/iced", default-features = false, featur
   "wayland",
 ] }
 iced_core = { git = "https://github.com/uriib/iced", default-features = false }
+iced_program = { git = "https://github.com/uriib/iced", default-features = false }
 iced_runtime = { git = "https://github.com/uriib/iced", default-features = false }
 iced_tiny_skia = { git = "https://github.com/uriib/iced", default-features = false }
 log = "0.4.29"

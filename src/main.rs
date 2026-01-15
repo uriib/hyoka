@@ -9,7 +9,7 @@
     str_as_str
 )]
 
-use std::{async_iter::AsyncIterator, future, pin::Pin};
+use std::async_iter::AsyncIterator;
 
 use compio::{driver::ProactorBuilder, runtime::Runtime};
 use smallstr::SmallString;
@@ -57,7 +57,8 @@ fn main() {
 mod consumer;
 mod mapping;
 mod modules;
-mod sync;
+mod program;
+mod shell;
 mod wayland;
 
 pub type TinyString = SmallString<[u8; 16]>;
@@ -78,12 +79,19 @@ impl<X, Y> Split for Option<(X, Y)> {
     }
 }
 
-trait AsyncIteratorExt: AsyncIterator {
-    async fn next(self: Pin<&mut Self>) -> Option<Self::Item>;
-}
+pub fn stream<T: AsyncIterator>(iterator: T) -> impl futures::Stream<Item = T::Item> {
+    #[repr(transparent)]
+    struct Stream<T>(T);
+    impl<T: AsyncIterator> futures::Stream for Stream<T> {
+        type Item = <T as AsyncIterator>::Item;
 
-impl<T: AsyncIterator> AsyncIteratorExt for T {
-    async fn next(mut self: Pin<&mut Self>) -> Option<Self::Item> {
-        future::poll_fn(|ctx| self.as_mut().poll_next(ctx)).await
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let inner: std::pin::Pin<&mut T> = unsafe { std::mem::transmute(self) };
+            AsyncIterator::poll_next(std::pin::pin!(inner), cx)
+        }
     }
+    Stream(iterator)
 }

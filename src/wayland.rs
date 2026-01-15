@@ -1,6 +1,7 @@
 use std::{
     borrow::Borrow,
-    ffi::{c_char, c_void},
+    ffi::{CStr, c_char, c_void},
+    fmt::{self, Debug, Formatter},
     mem,
     os::fd::BorrowedFd,
     pin::Pin,
@@ -8,9 +9,11 @@ use std::{
 };
 
 use compio::net::PollFd;
+use derive_where::derive_where;
 use iced::{Point, mouse};
+use rustix::path::Arg;
 
-use crate::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
 #[allow(
     dead_code,
@@ -37,7 +40,7 @@ pub enum Event {
         serial: u32,
     },
     Mouse(mouse::Event),
-    CallbackDone(NonNull<ffi::wl_callback>),
+    CallbackDone(Object<ffi::wl_callback>),
 }
 
 pub struct Server {
@@ -148,11 +151,12 @@ pub const POINTER_LISTENERL: ffi::wl_pointer_listener = ffi::wl_pointer_listener
         ) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
             // Sometimes surface is null. Why can surface be null ? idk. It's not nullable in protocol
-            // Maybe a bug of Hyprland
             if let Some(surface) = NonNull::new(surface) {
-                notifier.send(Event::Enter { surface, serial }).unwrap();
                 notifier
-                    .send(Event::Mouse(mouse::Event::CursorMoved {
+                    .unbounded_send(Event::Enter { surface, serial })
+                    .unwrap();
+                notifier
+                    .unbounded_send(Event::Mouse(mouse::Event::CursorMoved {
                         position: Point::new(x.into(), y.into()),
                     }))
                     .unwrap();
@@ -168,16 +172,8 @@ pub const POINTER_LISTENERL: ffi::wl_pointer_listener = ffi::wl_pointer_listener
             _surface: *mut ffi::wl_surface,
         ) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
-            // notifier
-            //     .send(Event::Mouse(mouse::Event::CursorMoved {
-            //         position: Point {
-            //             x: f32::INFINITY,
-            //             y: f32::INFINITY,
-            //         },
-            //     }))
-            //     .unwrap();
             notifier
-                .send(Event::Mouse(mouse::Event::CursorLeft))
+                .unbounded_send(Event::Mouse(mouse::Event::CursorLeft))
                 .unwrap();
         }
         Some(leave)
@@ -192,7 +188,7 @@ pub const POINTER_LISTENERL: ffi::wl_pointer_listener = ffi::wl_pointer_listener
         ) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
             notifier
-                .send(Event::Mouse(mouse::Event::CursorMoved {
+                .unbounded_send(Event::Mouse(mouse::Event::CursorMoved {
                     position: Point::new(x.into(), y.into()),
                 }))
                 .unwrap();
@@ -222,7 +218,7 @@ pub const POINTER_LISTENERL: ffi::wl_pointer_listener = ffi::wl_pointer_listener
                 ffi::WL_POINTER_BUTTON_STATE_PRESSED => mouse::Event::ButtonPressed(button),
                 _ => unreachable!(),
             };
-            notifier.send(Event::Mouse(event)).unwrap()
+            notifier.unbounded_send(Event::Mouse(event)).unwrap()
         }
         Some(button)
     },
@@ -257,7 +253,7 @@ pub const XDG_POPUP_LISTENER: ffi::xdg_popup_listener = ffi::xdg_popup_listener 
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
             let size = [width as u32, height as u32];
             notifier
-                .send(Event::Resize {
+                .unbounded_send(Event::Resize {
                     object: NonNull::new(popup as _).unwrap(),
                     size,
                 })
@@ -296,7 +292,7 @@ pub const SURFACE_LISTENER: ffi::wl_surface_listener = ffi::wl_surface_listener 
         extern "C" fn scale(data: *mut c_void, surface: *mut ffi::wl_surface, scale: i32) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
             notifier
-                .send(Event::Rescale {
+                .unbounded_send(Event::Rescale {
                     surface: NonNull::new(surface).unwrap(),
                     factor: scale as _,
                 })
@@ -320,7 +316,7 @@ pub const LAYER_SURFACE_LISTENER: ffi::zwlr_layer_surface_v1_listener =
                 unsafe { ffi::zwlr_layer_surface_v1_ack_configure(surface, serial) };
                 let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
                 notifier
-                    .send(Event::Resize {
+                    .unbounded_send(Event::Resize {
                         object: NonNull::new(surface as _).unwrap(),
                         size: [width, height],
                     })
@@ -340,42 +336,97 @@ pub const CALLBACK_LISTENER: ffi::wl_callback_listener = ffi::wl_callback_listen
         ) {
             let notifier = unsafe { &mut *(data as *mut UnboundedSender<Event>) };
             notifier
-                .send(Event::CallbackDone(NonNull::new(callback).unwrap()))
+                .unbounded_send(Event::CallbackDone(Object::from_raw(callback)))
                 .unwrap();
         }
         Some(done)
     },
 };
 
-#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Callback(NonNull<ffi::wl_callback>);
+#[derive_where(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Object<T>(NonNull<T>);
 
-impl Callback {
-    pub fn from_raw(callback: *mut ffi::wl_callback) -> Self {
-        Self(NonNull::new(callback).unwrap())
+impl<T> Debug for Object<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let proxy = self.0.cast().as_ptr();
+        let name = unsafe { ffi::wl_proxy_get_class(proxy) };
+        let name = unsafe { CStr::from_ptr(name) };
+        let name = name.as_str().map_err(|_| fmt::Error)?;
+        f.debug_tuple(name)
+            .field(&unsafe { ffi::wl_proxy_get_id(proxy) })
+            .finish()?;
+
+        write!(f, "at {:?}", self.0)?;
+        Ok(())
     }
 }
 
-impl Borrow<NonNull<ffi::wl_callback>> for Callback {
-    fn borrow(&self) -> &NonNull<ffi::wl_callback> {
+impl<T> Object<T> {
+    fn from_raw(object: *mut T) -> Self {
+        Self(NonNull::new(object).unwrap())
+    }
+}
+
+unsafe impl<T> Send for Object<T> {}
+unsafe impl<T> Sync for Object<T> {}
+
+#[derive_where(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OwnedObject<T: Interface>(Object<T>);
+
+impl<T: Interface> OwnedObject<T> {
+    pub fn from_raw(object: *mut T) -> Self {
+        Self(Object::from_raw(object))
+    }
+}
+
+pub trait Interface {
+    fn drop(ptr: *mut Self);
+}
+
+impl Interface for ffi::wl_callback {
+    fn drop(ptr: *mut Self) {
+        unsafe { ffi::wl_callback_destroy(ptr) }
+    }
+}
+
+impl<T: Interface> Drop for OwnedObject<T> {
+    fn drop(&mut self) {
+        T::drop(self.0.0.as_ptr())
+    }
+}
+
+impl<T: Interface> Borrow<Object<T>> for OwnedObject<T> {
+    fn borrow(&self) -> &Object<T> {
         &self.0
     }
 }
 
-impl Drop for Callback {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::wl_callback_destroy(self.0.as_ptr());
-        }
-    }
-}
+pub type Callback = OwnedObject<ffi::wl_callback>;
+
+// #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+// pub struct Callback(NonNull<ffi::wl_callback>);
+//
+// impl Callback {
+//     pub fn from_raw(callback: *mut ffi::wl_callback) -> Self {
+//         Self(NonNull::new(callback).unwrap())
+//     }
+// }
+//
+// impl Borrow<NonNull<ffi::wl_callback>> for Callback {
+//     fn borrow(&self) -> &NonNull<ffi::wl_callback> {
+//         &self.0
+//     }
+// }
+//
+// impl Drop for Callback {
+//     fn drop(&mut self) {
+//         unsafe {
+//             ffi::wl_callback_destroy(self.0.as_ptr());
+//         }
+//     }
+// }
 
 pub fn new() -> (Server, Client) {
-    // let name = std::env::var_os("WAYLAND_DISPLAY")
-    //     .unwrap()
-    //     .into_c_str()
-    //     .unwrap();
-    // let name = name.as_c_str();
     let display = NonNull::new(unsafe { ffi::wl_display_connect(ptr::null_mut()) }).unwrap();
     let registry = unsafe { ffi::wl_display_get_registry(display.as_ptr()) };
     let mut globals = GlobalsBuilder::default();
@@ -422,7 +473,7 @@ macro_rules! use_globals {
                             Restrict::from_ptr(interface.name),
                         )
                     } {
-                        self.$name = unsafe { mem::transmute(ffi::wl_registry_bind(registry, name, interface, version)) };
+                        self.$name = unsafe { ffi::wl_registry_bind(registry, name, interface, version) }.cast();
                         return;
                     }
                 )*
