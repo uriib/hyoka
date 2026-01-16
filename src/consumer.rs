@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     pin,
     ptr::{self, NonNull},
     time::{Duration, Instant},
@@ -302,7 +303,31 @@ impl Runner {
     }
     fn dispatch_app_event(&mut self, event: AppEvent) {
         for window in &self.window_manager.subscribers {
-            window.state.borrow_mut().program().dispatch(&event);
+            let state = &mut *window.state.borrow_mut();
+            state.program.dispatch(&event);
+            match &window.surface().role {
+                Role::Layer { .. } => {}
+                Role::Popup { size, .. } => {
+                    let new_size = {
+                        let mut view = state.program.view();
+                        let mut tree = Tree::new(&view);
+                        let node = view.as_widget_mut().layout(
+                            &mut tree,
+                            &mut state.renderer,
+                            &Limits::new(Size::ZERO, Size::INFINITE),
+                        );
+                        node.bounds().size()
+                    };
+                    let size = size.replace(new_size);
+                    if size.width < new_size.width || size.height < new_size.height {
+                        state.resize(
+                            [new_size.width, new_size.height].map(|x| x as _),
+                            window.surface().surface,
+                            &self.wayland.globals,
+                        );
+                    }
+                }
+            }
             window.request_redraw(
                 window.surface().surface,
                 &mut self.wayland.notifier,
@@ -313,7 +338,7 @@ impl Runner {
             wayland::ffi::wl_display_flush(self.display.as_ptr());
         }
     }
-    async fn action(&mut self, role: Role, cursor: Cursor, action: Action) -> Option<()> {
+    async fn action(&mut self, role: &Role, cursor: Cursor, action: Action) -> Option<()> {
         match action {
             Action::Workspace { id } => {
                 self.hyprctl
@@ -375,7 +400,7 @@ impl Runner {
         &mut self,
         program: Box<dyn Program>,
         [x, y]: [u32; 2],
-        parent: Role,
+        parent: &Role,
         subscribe: bool,
     ) -> Option<&Window> {
         let mut renderer = renderer();
@@ -474,6 +499,7 @@ impl Runner {
                 xdg_surface: NonNull::new(xdg_surface).unwrap(),
                 popup: NonNull::new(popup).unwrap(),
                 positioner: NonNull::new(positioner).unwrap(),
+                size: Cell::new(Size::new(width, height)),
             },
             renderer,
             program,

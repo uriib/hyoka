@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     fmt, mem,
     ops::{Deref, Index},
@@ -34,10 +34,10 @@ use crate::{
         Action, Callbacks, Runner,
         programs::{Element, Program, Signal, UserInterface},
     },
-    wayland::{self, Callback, Event},
+    wayland::{self, Callback, Event, Globals},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Role {
     Layer {
         layer_surface: NonNull<wayland::ffi::zwlr_layer_surface_v1>,
@@ -46,6 +46,7 @@ pub enum Role {
         xdg_surface: NonNull<wayland::ffi::xdg_surface>,
         popup: NonNull<wayland::ffi::xdg_popup>,
         positioner: NonNull<wayland::ffi::xdg_positioner>,
+        size: Cell<Size>,
     },
 }
 
@@ -59,6 +60,7 @@ impl Role {
                 xdg_surface,
                 popup,
                 positioner,
+                ..
             } => unsafe {
                 wayland::ffi::xdg_popup_destroy(popup.as_ptr());
                 wayland::ffi::xdg_surface_destroy(xdg_surface.as_ptr());
@@ -94,7 +96,7 @@ impl Default for ConfigState<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Surface {
     pub role: Role,
     pub surface: WlSurface,
@@ -114,9 +116,9 @@ pub struct State {
     serial: Option<u32>,
     shape: Option<Interaction>,
     config_state: ConfigState<'static>,
-    renderer: Renderer,
+    pub renderer: Renderer,
 
-    program: Box<dyn Program>,
+    pub program: Box<dyn Program>,
 }
 
 fn rebuild_ui<'ui>(
@@ -132,8 +134,46 @@ fn rebuild_ui<'ui>(
 }
 
 impl State {
-    pub fn program(&mut self) -> &mut dyn Program {
-        &mut *self.program
+    pub fn resize(
+        &mut self,
+        size @ [width, height]: [u32; 2],
+        surface: WlSurface,
+        globals: &Globals,
+    ) {
+        match mem::take(&mut self.config_state) {
+            ConfigState::Configured { buffer, ui, .. } => {
+                let viewport = buffer.viewport.with_surface_size(size);
+                self.config_state = ConfigState::Configured {
+                    buffer: globals.create_buffer(viewport),
+                    ui: ui.relayout(Size::new(width as _, height as _), &mut self.renderer),
+                    clip_mask: viewport.mask(),
+                    last_layers: None,
+                };
+            }
+            ConfigState::Unconfigured { scale_factor } => {
+                let viewport = Viewport {
+                    surface_size: size,
+                    buffer_scale: scale_factor,
+                    _buffer_transform: wayland::ffi::WL_OUTPUT_TRANSFORM_NORMAL,
+                };
+
+                let buffer = globals.create_buffer(viewport);
+                unsafe {
+                    wayland::ffi::wl_surface_attach(surface.as_ptr(), buffer.buffer.as_ptr(), 0, 0)
+                };
+                self.config_state = ConfigState::Configured {
+                    buffer,
+                    ui: iced_runtime::UserInterface::build::<Element<'static>>(
+                        unsafe { mem::transmute(self.program.view()) },
+                        Size::new(width as _, height as _),
+                        Cache::new(),
+                        &mut self.renderer,
+                    ),
+                    clip_mask: viewport.mask(),
+                    last_layers: None,
+                };
+            }
+        }
     }
     fn redraw(
         &mut self,
@@ -319,47 +359,9 @@ impl Window {
             }),
         }))
     }
-    pub fn resize(&self, size @ [width, height]: [u32; 2], runner: &mut Runner) {
+    pub fn resize(&self, size: [u32; 2], runner: &mut Runner) {
         let mut window = self.state.borrow_mut();
-        match mem::take(&mut window.config_state) {
-            ConfigState::Configured { buffer, ui, .. } => {
-                let viewport = buffer.viewport.with_surface_size(size);
-                window.config_state = ConfigState::Configured {
-                    buffer: runner.wayland.globals.create_buffer(viewport),
-                    ui: ui.relayout(Size::new(width as _, height as _), &mut window.renderer),
-                    clip_mask: viewport.mask(),
-                    last_layers: None,
-                };
-            }
-            ConfigState::Unconfigured { scale_factor } => {
-                let viewport = Viewport {
-                    surface_size: size,
-                    buffer_scale: scale_factor,
-                    _buffer_transform: wayland::ffi::WL_OUTPUT_TRANSFORM_NORMAL,
-                };
-
-                let buffer = runner.wayland.globals.create_buffer(viewport);
-                unsafe {
-                    wayland::ffi::wl_surface_attach(
-                        self.surface.0.surface.as_ptr(),
-                        buffer.buffer.as_ptr(),
-                        0,
-                        0,
-                    )
-                };
-                window.config_state = ConfigState::Configured {
-                    buffer,
-                    ui: iced_runtime::UserInterface::build::<Element<'static>>(
-                        unsafe { mem::transmute(window.program.view()) },
-                        Size::new(width as _, height as _),
-                        Cache::new(),
-                        &mut window.renderer,
-                    ),
-                    clip_mask: viewport.mask(),
-                    last_layers: None,
-                };
-            }
-        }
+        window.resize(size, self.surface.0.surface, &runner.wayland.globals);
         self.request_redraw(
             self.surface.0.surface,
             &mut runner.wayland.notifier,
@@ -511,7 +513,7 @@ impl Window {
             }
         }
 
-        let Surface { role, .. } = self.surface.0;
+        let Surface { role, .. } = &self.surface.0;
         for message in messages {
             match message {
                 Signal::Message(message) => program.update(message),
