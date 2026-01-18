@@ -60,6 +60,6 @@ impl Clock {
     }
     pub fn weekday(&self) -> &'static str {
         ["日", "月", "火", "水", "木", "金", "土"]
-            [self.date_time.weekday().number_from_monday() as usize]
+            [self.date_time.weekday().number_from_monday() as usize % 7]
     }
 }
