@@ -15,14 +15,9 @@ use rustix::path::Arg;
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 
-#[allow(
-    dead_code,
-    non_camel_case_types,
-    non_upper_case_globals,
-    unsafe_op_in_unsafe_fn
-)]
+#[allow(dead_code, non_camel_case_types, non_upper_case_globals)]
 pub mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    include!(concat!(env!("OUT_DIR"), "/bindings/wayland.rs"));
 }
 
 #[derive(Debug)]

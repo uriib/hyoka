@@ -29,7 +29,10 @@ fn main() {
         sources.push(source_path.to_str().unwrap().to_string());
     }
 
-    let bindings = bindgen::Builder::default()
+    let bindings = out_dir.join("bindings");
+    std::fs::create_dir_all(&bindings).unwrap();
+
+    let wayland = bindgen::Builder::default()
         .blocklist_item("FP_INFINITE")
         .blocklist_item("FP_INT_DOWNWARD")
         .blocklist_item("FP_INT_TONEAREST")
@@ -49,8 +52,7 @@ fn main() {
         .wrap_unsafe_ops(true)
         .generate()
         .unwrap();
-
-    bindings.write_to_file(out_dir.join("bindings.rs")).unwrap();
+    wayland.write_to_file(bindings.join("wayland.rs")).unwrap();
 
     let wrapper = env::temp_dir().join("bindgen").join("extern.c");
     cc::Build::new()
