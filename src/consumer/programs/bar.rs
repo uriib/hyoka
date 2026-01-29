@@ -227,7 +227,7 @@ impl Bar {
             .height(Length::Fill)
             .shaping(Shaping::Basic)
             .center()
-            .width(60)
+            .width(64)
             .align_x(Alignment::Center)
             .into();
         let weekday = text(self.weekday).size(15).height(Length::Fill).center();
