@@ -14,9 +14,9 @@ bytes = { version = "1.11.0", default-features = false }
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 compio = { version = "0.18.0", default-features = false, features = [
   "io-uring",
+  "net",
   "nightly",
   "runtime",
-  "net",
   "time"
 ] }
 concat-idents = "1.1.5"
