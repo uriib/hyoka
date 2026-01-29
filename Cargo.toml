@@ -12,10 +12,11 @@ ahash = { version = "0.8.12", default-features = false }
 arrayvec = "0.7.6"
 bytes = { version = "1.11.0", default-features = false }
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
-compio = { version = "0.17.0", default-features = false, features = [
+compio = { version = "0.18.0", default-features = false, features = [
   "io-uring",
   "nightly",
   "runtime",
+  "net",
   "time"
 ] }
 concat-idents = "1.1.5"

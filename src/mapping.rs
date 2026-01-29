@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use compio::buf::{IoBuf, IoBufMut, SetBufInit};
+use compio::buf::{IoBuf, IoBufMut, SetLen};
 use rustix::{
     io,
     mm::{MapFlags, ProtFlags},
@@ -93,29 +93,25 @@ impl Mapping<Const<4096>> {
     }
 }
 
-unsafe impl<S: Size> IoBufMut for Mapping<S> {
-    fn as_buf_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr.as_ptr()
+impl<S: Size> IoBufMut for Mapping<S> {
+    fn as_uninit(&mut self) -> &mut [mem::MaybeUninit<u8>] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr().cast(), self.len.size()) }
     }
 }
 
-unsafe impl<S: Size> IoBuf for Mapping<S> {
-    fn as_buf_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
-    }
-
+impl<S: Size> IoBuf for Mapping<S> {
     // use it to read only once
     fn buf_len(&self) -> usize {
         0
     }
 
-    fn buf_capacity(&self) -> usize {
-        self.len.size()
+    fn as_init(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
-impl<S: Size> SetBufInit for Mapping<S> {
-    unsafe fn set_buf_init(&mut self, _len: usize) {}
+impl<S: Size> SetLen for Mapping<S> {
+    unsafe fn set_len(&mut self, _len: usize) {}
 }
 
 impl<S: Size> AsRef<[u8]> for Mapping<S> {
