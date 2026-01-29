@@ -23,7 +23,8 @@ impl Listener {
             stream: uevent()?,
         })
     }
-    pub async gen fn listen(&mut self) -> Event {
+    #[allow(dead_code)]
+    pub async gen fn stream(&mut self) -> Event {
         let mut buf = Mapping::page().unwrap();
 
         loop {
@@ -34,6 +35,21 @@ impl Listener {
 
             if let Some(e) = parse_listen(read, Some(self.name.as_str())) {
                 yield e;
+            }
+        }
+    }
+    // TODO: refactor this: check if type changes to battery
+    pub async fn listen(&mut self, mut dispatch: impl AsyncFnMut(Event)) {
+        let mut buf = Mapping::page().unwrap();
+
+        loop {
+            let res;
+            BufResult(res, buf) = self.stream.read(buf).await;
+            let n = res.unwrap();
+            let read = unsafe { buf.as_bytes().get_unchecked(..n) };
+
+            if let Some(e) = parse_listen(read, Some(self.name.as_str())) {
+                dispatch(e).await
             }
         }
     }
@@ -183,7 +199,7 @@ fn parse_lines<'a>(lines: impl Iterator<Item = &'a [u8]>, filter: Option<&str>) 
             b"POWER_SUPPLY_NAME" => {
                 let value = unsafe { str::from_utf8_unchecked(value) };
                 if let Some(filter) = filter {
-                    if value == filter {
+                    if value != filter {
                         return None;
                     }
                 }

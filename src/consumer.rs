@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    pin,
     ptr::{self, NonNull},
     time::{Duration, Instant},
 };
@@ -112,13 +111,11 @@ impl Consumer {
                 let mut listener = battery::Listener::new(name).unwrap();
 
                 let listen = async {
-                    pin::pin!(crate::stream(listener.listen()))
-                        .map(AppEvent::Battery)
-                        .map(Event::App)
-                        .map(Ok)
-                        .forward(sender)
+                    listener
+                        .listen(async |e| {
+                            sender.send(Event::App(AppEvent::Battery(e))).await.unwrap()
+                        })
                         .await
-                        .unwrap();
                 };
 
                 let mut sender = events.clone();
