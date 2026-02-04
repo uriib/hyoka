@@ -56,12 +56,24 @@ impl Program for Battery {
     }
     fn background(&self, _theme: &Theme) -> Color {
         Color::TRANSPARENT
-        // Color::from_rgba(1.0, 0.0, 0.0, 0.5)
     }
     fn dispatch(&mut self, event: &AppEvent) {
         match event {
             AppEvent::Battery(e) => self.content = e.tooltip(),
             _ => {}
         }
+    }
+}
+
+pub struct Tooltip {
+    pub content: TinyString,
+}
+
+impl Program for Tooltip {
+    fn view(&self) -> Element<'_> {
+        tooltip_text(&self.content, 10.0, Shaping::Basic)
+    }
+    fn background(&self, _theme: &Theme) -> Color {
+        Color::TRANSPARENT
     }
 }

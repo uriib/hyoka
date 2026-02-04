@@ -1,5 +1,6 @@
 use std::{fs, io::Cursor, num::NonZero, path::Path};
 
+use ahash::AHashMap;
 use arrayvec::ArrayVec;
 use iced::{
     Alignment, Border, Font, Length, Padding, Theme,
@@ -22,7 +23,11 @@ use crate::{
         theme,
     },
     mapping::Mapping,
-    modules::{battery, clock, hyprland},
+    modules::{
+        battery, clock,
+        dbus::{Tray, TrayEvent},
+        hyprland,
+    },
 };
 
 struct BitSet(u16);
@@ -48,10 +53,16 @@ struct WindowInfo {
     icon: Option<Handle>,
 }
 
+struct TrayItem {
+    icon: Option<Handle>,
+}
+
 pub struct Bar {
     workspaces: BitSet,
     workspace_focused: usize,
     window: WindowInfo,
+
+    tray_items: AHashMap<Tray, TrayItem>,
 
     battery_icon: Option<Handle>,
     battery_event: Option<battery::Event>,
@@ -115,6 +126,7 @@ impl Bar {
                 title: TinyString::new(),
                 icon: None,
             },
+            tray_items: AHashMap::new(),
             battery_icon: None,
             battery_event: None,
             date: now.date(),
@@ -203,6 +215,22 @@ impl Bar {
             .on_enter(Signal::Action(Action::WindowInfo))
             .on_exit(Signal::Action(Action::CloseTooltip))
     }
+    fn tray(&self) -> Element<'_> {
+        row(self
+            .tray_items
+            .iter()
+            .filter_map(|(service, TrayItem { icon })| {
+                icon.clone().map(|icon| {
+                    mouse_area(icon.load_size(22))
+                        .on_enter(Signal::Action(Action::TrayTooltip(service.clone())))
+                        .on_exit(Signal::Action(Action::CloseTooltip))
+                        .on_press(Signal::Action(Action::TrayAction(service.clone())))
+                        .into()
+                })
+            }))
+        .spacing(7)
+        .into()
+    }
     fn battery(&self) -> Option<Element<'_>> {
         let icon = self.battery_icon.clone().map(|x| x.load_size(17))?;
         Some(if let Some(ref e) = self.battery_event {
@@ -253,7 +281,7 @@ impl Program for Bar {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let right = widget::row![self.battery(), self.clock().into()]
+        let right = widget::row![self.tray(), self.battery(), self.clock().into()]
             .align_y(Vertical::Center)
             .padding(Padding::new(0.0).right(13))
             .spacing(9)
@@ -288,6 +316,30 @@ impl Program for Bar {
                 self.time = e.time();
                 self.weekday = e.weekday();
             }
+            AppEvent::Tray(e) => match e {
+                TrayEvent::Registered { service, icon_name } => {
+                    let icon_name = TinyString::from_str(unsafe {
+                        str::from_utf8_unchecked(icon_name.as_bytes())
+                    });
+                    let icon = self.load_icon(&icon_name.into(), false);
+                    self.tray_items.insert(service.clone(), TrayItem { icon });
+                }
+                TrayEvent::NewIcon { service, icon_name } => {
+                    let icon_name = TinyString::from_str(unsafe {
+                        str::from_utf8_unchecked(icon_name.as_bytes())
+                    });
+                    let icon = self.load_icon(&icon_name.into(), false);
+                    if let Some(item) = self.tray_items.get_mut(service) {
+                        item.icon = icon;
+                    }
+                }
+                TrayEvent::Unregistered(service) => {
+                    self.tray_items.remove(service);
+                }
+                TrayEvent::Disconnected => {
+                    self.tray_items.clear();
+                }
+            },
         }
     }
 }

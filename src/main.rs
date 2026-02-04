@@ -1,6 +1,8 @@
 #![feature(
     allocator_api,
     async_iterator,
+    const_convert,
+    const_trait_impl,
     future_join,
     gen_blocks,
     int_from_ascii,

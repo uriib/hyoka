@@ -4,7 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{SinkExt as _, StreamExt as _, channel::mpsc::channel};
+use futures::{
+    SinkExt as _, StreamExt as _,
+    channel::mpsc::{Sender, channel},
+};
 use iced::{
     Color, Font, Pixels, Point, Size, Theme, color,
     font::{Family, Stretch, Style, Weight},
@@ -22,8 +25,9 @@ use crate::{
         window::{Role, Window, WindowManager},
     },
     modules::{
-        battery,
+        self, battery,
         clock::{self, Clock},
+        dbus::Tray,
         hyprland,
     },
     wayland,
@@ -42,6 +46,7 @@ pub enum AppEvent {
     Hyprland(hyprland::Event),
     Battery(battery::Event),
     Clock(clock::Clock),
+    Tray(modules::dbus::TrayEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +54,8 @@ pub enum Action {
     Workspace { id: u8 },
     WindowInfo,
     Battery(TinyString),
+    TrayTooltip(Tray),
+    TrayAction(Tray),
     CloseTooltip,
 }
 
@@ -149,8 +156,16 @@ impl Consumer {
             }
         };
 
+        let sender = notifier.clone();
+        let (dbus_daemon, dbus_client) = modules::dbus::new(Dispatcher(sender)).await.split();
+        let dbus = async {
+            if let Some(daemon) = dbus_daemon {
+                daemon.serve().await;
+            }
+        };
+
         notifier.flush().await.unwrap();
-        let mut runner = Runner::new(wayland_proxy, display, hyprctl);
+        let mut runner = Runner::new(wayland_proxy, display, hyprctl, dbus_client);
         let consumer = async move {
             loop {
                 // TODO: dispatch all pending events at once
@@ -163,15 +178,30 @@ impl Consumer {
             }
         };
 
-        std::future::join!(wayland, consumer, hyprland, battery_serve, clock).await;
+        std::future::join!(wayland, consumer, hyprland, battery_serve, clock, dbus).await;
     }
 }
 
 type Callbacks = FxHashMap<wayland::Callback, Box<dyn FnOnce(&mut Runner)>>;
 
+#[derive(Clone)]
+struct Dispatcher(Sender<Event>);
+impl modules::dbus::Dispatcher for Dispatcher {
+    async fn dispatch(&mut self, e: impl Into<modules::dbus::Event>) {
+        match e.into() {
+            modules::dbus::Event::Tray(tray_event) => self
+                .0
+                .send(Event::App(AppEvent::Tray(tray_event)))
+                .await
+                .unwrap(),
+        }
+    }
+}
+
 struct Runner {
     wayland: wayland::Proxy,
     hyprctl: Option<hyprland::Context>,
+    dbus: Option<modules::dbus::Client<Dispatcher>>,
 
     window_manager: WindowManager,
     display: NonNull<wayland::ffi::wl_display>,
@@ -189,6 +219,7 @@ impl Runner {
         mut wayland: wayland::Proxy,
         display: NonNull<wayland::ffi::wl_display>,
         hyprctl: Option<hyprland::Context>,
+        dbus: Option<modules::dbus::Client<Dispatcher>>,
     ) -> Self {
         let mut window_manager = WindowManager::default();
         let surface =
@@ -256,6 +287,7 @@ impl Runner {
             wayland,
             display,
             hyprctl,
+            dbus,
             tooltip: None,
             window_manager,
             theme: theme(),
@@ -373,11 +405,28 @@ impl Runner {
             Action::Battery(init) => {
                 if let Some(win) = self.tooltip.take() {
                     self.window_manager.close_window(win.surface());
-                }
+                };
                 if let Cursor::Available(Point { x, .. }) = cursor {
                     self.tooltip = self
                         .popup(
                             Box::new(tooltip::Battery { content: init }),
+                            [x as _, BAR_HEIGHT + 1],
+                            role,
+                            true,
+                        )
+                        .map(|x| x.clone());
+                }
+            }
+            Action::TrayTooltip(service) => {
+                if let Some(win) = self.tooltip.take() {
+                    self.window_manager.close_window(win.surface());
+                }
+                if let Cursor::Available(Point { x, .. }) = cursor {
+                    let content =
+                        TinyString::from_string(self.dbus.as_mut()?.tray_tooltip(service).await?);
+                    self.tooltip = self
+                        .popup(
+                            Box::new(tooltip::Tooltip { content }),
                             [x as _, BAR_HEIGHT + 1],
                             role,
                             true,
@@ -390,6 +439,7 @@ impl Runner {
                     self.window_manager.close_window(win.surface());
                 }
             }
+            Action::TrayAction(service) => self.dbus.as_mut()?.tray_action(service).await,
         }
         Some(())
     }
