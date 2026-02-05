@@ -38,7 +38,7 @@ pub enum Event {
     CallbackDone(Object<ffi::wl_callback>),
 }
 
-pub struct Server {
+pub struct Daemon {
     display: NonNull<ffi::wl_display>,
 }
 
@@ -47,12 +47,7 @@ pub struct Proxy {
     pub notifier: Pin<Box<UnboundedSender<Event>>>,
 }
 
-pub struct Client {
-    pub proxy: Proxy,
-    pub events: UnboundedReceiver<Event>,
-}
-
-impl Server {
+impl Daemon {
     pub fn display(&self) -> NonNull<ffi::wl_display> {
         self.display
     }
@@ -398,30 +393,7 @@ impl<T: Interface> Borrow<Object<T>> for OwnedObject<T> {
 
 pub type Callback = OwnedObject<ffi::wl_callback>;
 
-// #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-// pub struct Callback(NonNull<ffi::wl_callback>);
-//
-// impl Callback {
-//     pub fn from_raw(callback: *mut ffi::wl_callback) -> Self {
-//         Self(NonNull::new(callback).unwrap())
-//     }
-// }
-//
-// impl Borrow<NonNull<ffi::wl_callback>> for Callback {
-//     fn borrow(&self) -> &NonNull<ffi::wl_callback> {
-//         &self.0
-//     }
-// }
-//
-// impl Drop for Callback {
-//     fn drop(&mut self) {
-//         unsafe {
-//             ffi::wl_callback_destroy(self.0.as_ptr());
-//         }
-//     }
-// }
-
-pub fn new() -> (Server, Client) {
+pub fn new() -> (Daemon, Proxy, UnboundedReceiver<Event>) {
     let display = NonNull::new(unsafe { ffi::wl_display_connect(ptr::null_mut()) }).unwrap();
     let registry = unsafe { ffi::wl_display_get_registry(display.as_ptr()) };
     let mut globals = GlobalsBuilder::default();
@@ -431,13 +403,7 @@ pub fn new() -> (Server, Client) {
     unsafe { ffi::xdg_wm_base_add_listener(globals.wm_base(), &WM_BASE_LISTENER, ptr::null_mut()) };
     let (notifier, events) = unbounded();
     let notifier = Box::pin(notifier);
-    (
-        Server { display },
-        Client {
-            proxy: Proxy { globals, notifier },
-            events,
-        },
-    )
+    (Daemon { display }, Proxy { globals, notifier }, events)
 }
 
 macro_rules! use_globals {

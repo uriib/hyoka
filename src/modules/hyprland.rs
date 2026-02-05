@@ -6,10 +6,6 @@ use compio::{
     io::{AsyncRead as _, AsyncReadExt, AsyncWrite as _},
     net::UnixStream,
 };
-use futures::{
-    SinkExt as _,
-    channel::mpsc::{self, Receiver, Sender},
-};
 
 use crate::{TinyString, mapping::Mapping};
 
@@ -177,22 +173,13 @@ impl Controller {
     }
 }
 
-pub struct Client {
-    pub context: Context,
-    pub events: Receiver<Event>,
-}
-
-pub struct Server {
+pub struct Daemon {
     listener: Listener,
-    notifier: Sender<Event>,
 }
 
-impl Server {
-    pub async fn run(self, init: Controller) {
-        let Self {
-            listener,
-            mut notifier,
-        } = self;
+impl Daemon {
+    pub async fn run(self, init: Controller, mut dispatch: impl AsyncFnMut(Event)) {
+        let Self { listener } = self;
 
         let res = init
             .raw_request("[[BATCH]]workspaces;activeworkspace;activewindow")
@@ -201,13 +188,13 @@ impl Server {
         if let Some(workspaces) = res.next() {
             for workspace in workspaces.split("\n\n") {
                 if let Some(id) = parse_workspace_id(workspace) {
-                    notifier.feed(Event::CreateWorkspace { id }).await.unwrap();
+                    dispatch(Event::CreateWorkspace { id }).await;
                 }
             }
         }
         if let Some(active_workspace) = res.next() {
             if let Some(id) = parse_workspace_id(active_workspace) {
-                notifier.feed(Event::Workspace { id }).await.unwrap();
+                dispatch(Event::Workspace { id }).await;
             }
         }
         if let Some(active_window) = res.next() {
@@ -229,36 +216,18 @@ impl Server {
                     break;
                 }
             }
-            notifier
-                .feed(Event::ActiveWindow { class, title })
-                .await
-                .unwrap();
+            dispatch(Event::ActiveWindow { class, title }).await;
         }
-        notifier.flush().await.unwrap();
 
-        listener
-            .listen(async |msg| {
-                notifier.send(msg).await.unwrap();
-            })
-            .await;
+        listener.listen(dispatch).await;
     }
 }
 
-pub async fn new() -> Option<(Server, Client)> {
+pub async fn new() -> Option<(Daemon, Context)> {
     let context = Context::new()?;
     let listener = context.listener().await;
-    let (sender, receiver) = mpsc::channel(3);
 
-    Some((
-        Server {
-            listener,
-            notifier: sender,
-        },
-        Client {
-            context,
-            events: receiver,
-        },
-    ))
+    Some((Daemon { listener }, context))
 }
 
 pub fn parse_workspace_id(data: &str) -> Option<usize> {

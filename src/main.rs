@@ -16,33 +16,6 @@ use std::async_iter::AsyncIterator;
 use compio::{driver::ProactorBuilder, runtime::Runtime};
 use smallstr::SmallString;
 
-use crate::{consumer::Consumer, modules::hyprland};
-
-async fn run() {
-    let (wayland_server, wayland) = wayland::new();
-
-    let (hyprland_server, hyprland) = hyprland::new().await.split();
-    let init = if let Some(x) = hyprland.as_ref() {
-        Some(x.context.controller().await)
-    } else {
-        None
-    };
-    let hyprland_serve = async {
-        match hyprland_server {
-            Some(server) => server.run(init.unwrap()).await,
-            None => {}
-        }
-    };
-
-    let consumer = Consumer {
-        wayland,
-        display: wayland_server.display(),
-        hyprland,
-    };
-
-    std::future::join!(consumer.run(), wayland_server.run(), hyprland_serve).await;
-}
-
 fn main() {
     let rt = Runtime::builder()
         .with_proactor({
@@ -53,7 +26,7 @@ fn main() {
         })
         .build()
         .unwrap();
-    rt.block_on(run());
+    rt.block_on(consumer::run());
 }
 
 mod consumer;

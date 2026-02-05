@@ -19,7 +19,7 @@ use compio::{
     net::UnixStream,
 };
 use dbus::{
-    self, Fields, Flags, MessageIterator, MessageType, OwnedMessage, Proxy, Serial,
+    self, Fields, Flags, MessageIterator, MessageType, OwnedMessage, Serial,
     authentication::Io,
     marshal::Marshal,
     signature::{MultiSignature, SignatureProxy},
@@ -118,7 +118,7 @@ impl<D> dbus::authentication::Io for Connection<D> {
     }
 }
 
-pub const DBUS: Proxy = Proxy {
+pub const DBUS: dbus::Proxy = dbus::Proxy {
     name: "org.freedesktop.DBus".into(),
     path: "/org/freedesktop/DBus".into(),
     interface: "org.freedesktop.DBus".into(),
@@ -183,7 +183,7 @@ impl<D: Dispatcher> Connection<D> {
 
     pub async fn method_call<'a>(
         &mut self,
-        proxy: Proxy<'_>,
+        proxy: dbus::Proxy<'_>,
         member: impl Into<&'a dbus::String>,
         arguments: impl Marshal + MultiSignature,
     ) -> Result<Notifier> {
@@ -196,11 +196,11 @@ impl<D: Dispatcher> Connection<D> {
 
     pub async fn get_property<'a>(
         &mut self,
-        proxy: Proxy<'_>,
+        proxy: dbus::Proxy<'_>,
         prop: impl Into<&'a dbus::String>,
     ) -> Result<Notifier> {
         self.method_call(
-            Proxy {
+            dbus::Proxy {
                 interface: "org.freedesktop.DBus.Properties".into(),
                 ..proxy
             },
@@ -212,7 +212,7 @@ impl<D: Dispatcher> Connection<D> {
 
     pub async fn method_call_silent<'a>(
         &mut self,
-        proxy: Proxy<'_>,
+        proxy: dbus::Proxy<'_>,
         member: impl Into<&'a dbus::String>,
         arguments: impl Marshal + MultiSignature,
     ) -> Result<()> {
@@ -344,7 +344,7 @@ impl<D: Dispatcher> Connection<D> {
         }
     }
 
-    async fn icon_name(&mut self, proxy: Proxy<'_>) -> Option<String> {
+    async fn icon_name(&mut self, proxy: dbus::Proxy<'_>) -> Option<String> {
         let icon_name = self.get_property(proxy, "IconName").await.unwrap();
 
         let icon_name = icon_name.await.unwrap();
@@ -360,7 +360,7 @@ impl<D: Dispatcher> Connection<D> {
         };
         Some(icon_name)
     }
-    async fn tooltip(&mut self, proxy: Proxy<'_>) -> Option<String> {
+    async fn tooltip(&mut self, proxy: dbus::Proxy<'_>) -> Option<String> {
         let tooltip = self.get_property(proxy, "ToolTip").await.unwrap();
 
         let tooltip = tooltip.await.unwrap();
@@ -449,21 +449,21 @@ pub enum TrayEvent {
     Disconnected,
 }
 
-pub async fn new<D: Dispatcher>(dispatch: D) -> Option<(Server<D>, Client<D>)> {
+pub async fn new<D: Dispatcher>(dispatch: D) -> Option<(Daemon<D>, Proxy<D>)> {
     let connection = Connection::session(dispatch).await.ok()?;
     Some((
-        Server {
+        Daemon {
             connection: connection.clone(),
         },
-        Client { connection },
+        Proxy { connection },
     ))
 }
 
-pub struct Server<D> {
+pub struct Daemon<D> {
     connection: Connection<D>,
 }
 
-impl<D: Dispatcher> Server<D> {
+impl<D: Dispatcher> Daemon<D> {
     async fn init(&mut self, tasks: &mut UnboundedSender<Task>) {
         self.connection
             .method_call_silent(
@@ -527,11 +527,11 @@ impl<D: Dispatcher> Server<D> {
     }
 }
 
-pub struct Client<D> {
+pub struct Proxy<D> {
     connection: Connection<D>,
 }
 
-impl<D: Dispatcher> Client<D> {
+impl<D: Dispatcher> Proxy<D> {
     pub async fn tray_tooltip(&mut self, service: Tray) -> Option<String> {
         self.connection.tooltip(service.proxy()).await
     }
@@ -605,8 +605,8 @@ impl Tray {
     fn path(&self) -> &dbus::ObjectPath {
         self.item().1
     }
-    fn proxy(&self) -> Proxy<'_> {
-        Proxy {
+    fn proxy(&self) -> dbus::Proxy<'_> {
+        dbus::Proxy {
             name: self.name(),
             path: self.path(),
             interface: "org.kde.StatusNotifierItem".into(),

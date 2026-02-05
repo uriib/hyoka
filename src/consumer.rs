@@ -59,127 +59,119 @@ pub enum Action {
     CloseTooltip,
 }
 
-pub struct Consumer {
-    pub wayland: wayland::Client,
-    pub display: NonNull<wayland::ffi::wl_display>,
-    pub hyprland: Option<hyprland::Client>,
-}
+pub async fn run() {
+    let (mut notifier, mut receiver) = channel(4);
 
-impl Consumer {
-    pub async fn run(self) {
-        let Self {
-            wayland:
-                wayland::Client {
-                    proxy: wayland_proxy,
-                    events: mut wayland_events,
-                },
-            display,
-            hyprland,
-        } = self;
-        let (mut notifier, mut receiver) = channel(4);
+    let (wayland_daemon, wayland_proxy, mut wayland_events) = wayland::new();
+    let mut sender = notifier.clone();
+    let wayland = async move {
+        loop {
+            sender
+                .send(Event::Wayland(wayland_events.next().await.unwrap()))
+                .await
+                .unwrap();
+        }
+    };
 
-        let mut sender = notifier.clone();
-        let wayland = async move {
-            loop {
-                sender
-                    .send(Event::Wayland(wayland_events.next().await.unwrap()))
+    let mut sender = notifier.clone();
+    let (hyprland_daemon, hyprctl) = hyprland::new().await.split();
+    let init = if let Some(x) = hyprctl.as_ref() {
+        Some(x.controller().await)
+    } else {
+        None
+    };
+    let hyprland = async {
+        match hyprland_daemon {
+            Some(daemon) => {
+                daemon
+                    .run(init.unwrap(), async |event| {
+                        sender
+                            .send(Event::App(AppEvent::Hyprland(event)))
+                            .await
+                            .unwrap();
+                    })
                     .await
-                    .unwrap();
             }
-        };
+            None => {}
+        }
+    };
 
-        let (hyprctl, hyprland_events) = hyprland
-            .map(|hyprland::Client { context, events }| (context, events))
-            .split();
+    let events = notifier.clone();
+    let battery_serve = async move {
+        let mut sender = events.clone();
+        if let Some((e, name, uevent)) = battery::init().unwrap() {
+            sender.feed(Event::App(AppEvent::Battery(e))).await.unwrap();
+            let mut listener = battery::Listener::new(name).unwrap();
 
-        let mut sender = notifier.clone();
-        let hyprland = async move {
-            if let Some(mut events) = hyprland_events {
-                while let Ok(e) = events.try_next() {
-                    sender
-                        .feed(Event::App(AppEvent::Hyprland(e.unwrap())))
-                        .await
-                        .unwrap();
-                }
-                loop {
-                    sender
-                        .send(Event::App(AppEvent::Hyprland(events.next().await.unwrap())))
-                        .await
-                        .unwrap();
-                }
-            }
-        };
+            let listen = async {
+                listener
+                    .listen(async |e| sender.send(Event::App(AppEvent::Battery(e))).await.unwrap())
+                    .await
+            };
 
-        let events = notifier.clone();
-        let battery_serve = async move {
             let mut sender = events.clone();
-            if let Some((e, name, uevent)) = battery::init().unwrap() {
-                sender.feed(Event::App(AppEvent::Battery(e))).await.unwrap();
-                let mut listener = battery::Listener::new(name).unwrap();
-
-                let listen = async {
-                    listener
-                        .listen(async |e| {
-                            sender.send(Event::App(AppEvent::Battery(e))).await.unwrap()
-                        })
-                        .await
-                };
-
-                let mut sender = events.clone();
-                let poll = async {
-                    loop {
-                        if let Some(e) = uevent.poll() {
-                            sender.send(Event::App(AppEvent::Battery(e))).await.unwrap();
-                        }
-                        let seconds = match e.status {
-                            battery::Status::Full | battery::Status::Charging => 3,
-                            _ => 6,
-                        };
-                        compio::time::sleep(Duration::from_secs(seconds)).await;
+            let poll = async {
+                loop {
+                    if let Some(e) = uevent.poll() {
+                        sender.send(Event::App(AppEvent::Battery(e))).await.unwrap();
                     }
-                };
-
-                std::future::join!(listen, poll).await;
-            }
-        };
-
-        let mut sender = notifier.clone();
-        let clock = async move {
-            let interval = Duration::from_secs(1);
-            let mut timer = compio::time::interval_at(Instant::now() + interval, interval);
-            loop {
-                timer.tick().await;
-                sender
-                    .send(Event::App(AppEvent::Clock(Clock::now())))
-                    .await
-                    .unwrap();
-            }
-        };
-
-        let sender = notifier.clone();
-        let (dbus_daemon, dbus_client) = modules::dbus::new(Dispatcher(sender)).await.split();
-        let dbus = async {
-            if let Some(daemon) = dbus_daemon {
-                daemon.serve().await;
-            }
-        };
-
-        notifier.flush().await.unwrap();
-        let mut runner = Runner::new(wayland_proxy, display, hyprctl, dbus_client);
-        let consumer = async move {
-            loop {
-                // TODO: dispatch all pending events at once
-                match receiver.next().await.unwrap() {
-                    Event::Wayland(event) => {
-                        runner.dispatch_wayland(event).await;
-                    }
-                    Event::App(event) => runner.dispatch_app_event(event),
+                    let seconds = match e.status {
+                        battery::Status::Full | battery::Status::Charging => 3,
+                        _ => 6,
+                    };
+                    compio::time::sleep(Duration::from_secs(seconds)).await;
                 }
-            }
-        };
+            };
 
-        std::future::join!(wayland, consumer, hyprland, battery_serve, clock, dbus).await;
-    }
+            std::future::join!(listen, poll).await;
+        }
+    };
+
+    let mut sender = notifier.clone();
+    let clock = async move {
+        let interval = Duration::from_secs(1);
+        let mut timer = compio::time::interval_at(Instant::now() + interval, interval);
+        loop {
+            timer.tick().await;
+            sender
+                .send(Event::App(AppEvent::Clock(Clock::now())))
+                .await
+                .unwrap();
+        }
+    };
+
+    let sender = notifier.clone();
+    let (dbus_daemon, dbus_proxy) = modules::dbus::new(Dispatcher(sender)).await.split();
+    let dbus = async {
+        if let Some(daemon) = dbus_daemon {
+            daemon.serve().await;
+        }
+    };
+
+    notifier.flush().await.unwrap();
+    let mut runner = Runner::new(wayland_proxy, wayland_daemon.display(), hyprctl, dbus_proxy);
+    let consumer = async move {
+        loop {
+            // TODO: dispatch all pending events at once
+            match receiver.next().await.unwrap() {
+                Event::Wayland(event) => {
+                    runner.dispatch_wayland(event).await;
+                }
+                Event::App(event) => runner.dispatch_app_event(event),
+            }
+        }
+    };
+
+    std::future::join!(
+        wayland_daemon.run(),
+        wayland,
+        consumer,
+        hyprland,
+        battery_serve,
+        clock,
+        dbus
+    )
+    .await;
 }
 
 type Callbacks = FxHashMap<wayland::Callback, Box<dyn FnOnce(&mut Runner)>>;
@@ -201,7 +193,7 @@ impl modules::dbus::Dispatcher for Dispatcher {
 struct Runner {
     wayland: wayland::Proxy,
     hyprctl: Option<hyprland::Context>,
-    dbus: Option<modules::dbus::Client<Dispatcher>>,
+    dbus: Option<modules::dbus::Proxy<Dispatcher>>,
 
     window_manager: WindowManager,
     display: NonNull<wayland::ffi::wl_display>,
@@ -219,7 +211,7 @@ impl Runner {
         mut wayland: wayland::Proxy,
         display: NonNull<wayland::ffi::wl_display>,
         hyprctl: Option<hyprland::Context>,
-        dbus: Option<modules::dbus::Client<Dispatcher>>,
+        dbus: Option<modules::dbus::Proxy<Dispatcher>>,
     ) -> Self {
         let mut window_manager = WindowManager::default();
         let surface =
