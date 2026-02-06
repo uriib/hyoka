@@ -13,7 +13,7 @@ use derive_where::derive_where;
 use iced::{Point, mouse};
 use rustix::path::Arg;
 
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 #[allow(dead_code, non_camel_case_types, non_upper_case_globals)]
 pub mod ffi {
@@ -358,7 +358,6 @@ impl<T> Object<T> {
 }
 
 unsafe impl<T> Send for Object<T> {}
-unsafe impl<T> Sync for Object<T> {}
 
 #[derive_where(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OwnedObject<T: Interface>(Object<T>);
@@ -401,7 +400,7 @@ pub fn new() -> (Daemon, Proxy, UnboundedReceiver<Event>) {
     unsafe { ffi::wl_display_roundtrip(display.as_ptr()) };
     let globals = globals.build();
     unsafe { ffi::xdg_wm_base_add_listener(globals.wm_base(), &WM_BASE_LISTENER, ptr::null_mut()) };
-    let (notifier, events) = unbounded();
+    let (notifier, events) = mpsc::unbounded();
     let notifier = Box::pin(notifier);
     (Daemon { display }, Proxy { globals, notifier }, events)
 }
