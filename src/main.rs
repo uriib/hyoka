@@ -17,6 +17,7 @@ use compio::{driver::ProactorBuilder, runtime::Runtime};
 use smallstr::SmallString;
 
 fn main() {
+    tracing_subscriber::fmt::init();
     let rt = Runtime::builder()
         .with_proactor({
             let mut builder = ProactorBuilder::new();

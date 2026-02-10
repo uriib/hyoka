@@ -25,6 +25,7 @@ use dbus::{
     signature::{MultiSignature, SignatureProxy},
     unmarshal::{self, ArrayIter, Unmarshal},
 };
+use derive_more::From;
 use futures::{
     StreamExt,
     channel::mpsc::{self, UnboundedSender},
@@ -430,15 +431,9 @@ impl<D: Dispatcher> Connection<D> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, From)]
 pub enum Event {
     Tray(TrayEvent),
-}
-
-impl From<TrayEvent> for Event {
-    fn from(value: TrayEvent) -> Self {
-        Self::Tray(value)
-    }
 }
 
 #[derive(Debug)]
